@@ -25,11 +25,13 @@ import hashlib
 import json
 import os
 import re
+import socket
 import unicodedata
 import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -73,6 +75,38 @@ _LANES = [None] + [u for u in os.environ.get("LIB_PROXIES", "").split(",") if u.
 _OPENERS = [urllib.request.build_opener(urllib.request.ProxyHandler({"http": u, "https": u}) if u else urllib.request.ProxyHandler({})) for u in _LANES]
 _PACE = [{"sleep": 0.0, "until": 0.0} for _ in _LANES]
 _TURN = itertools.count()
+_DEAD: set[int] = set()   # proxy lanes that refused us (e.g. the proxy denylists this runner's IP); never lane 0
+
+
+def _pick() -> int:
+    alive = [i for i in range(len(_LANES)) if i not in _DEAD] or [0]
+    return alive[next(_TURN) % len(alive)]
+
+
+def _proxy_refused(e: Exception) -> bool:
+    """True when the proxy itself said no (tunnel/auth failure), not the site: the lane is useless for this run."""
+    if getattr(e, "code", None) == 407:
+        return True
+    if isinstance(e, urllib.error.URLError) and not isinstance(e, urllib.error.HTTPError) \
+            and isinstance(e.reason, (ConnectionRefusedError, socket.gaierror)):
+        return True   # the proxy host itself is unreachable
+    m = str(getattr(e, "reason", "") or e)
+    return "Tunnel connection failed" in m or "ProxyError" in m or "Cannot connect to proxy" in m
+
+
+def probe_lanes() -> None:
+    """Try every proxy lane once before the run; a lane the proxy refuses is dropped so no request waits on it."""
+    for i in range(1, len(_LANES)):
+        try:
+            req = urllib.request.Request(f"{SITE}/", headers={"User-Agent": UA})
+            with _OPENERS[i].open(req, timeout=25) as r:
+                r.read(512)
+        except urllib.error.HTTPError as e:   # the site answered through the proxy (429 etc.): the lane works
+            if e.code == 407:
+                _DEAD.add(i)
+        except Exception:  # noqa: BLE001
+            _DEAD.add(i)
+    print(f"[lanes] {len(_LANES) - len(_DEAD)} of {len(_LANES)} usable", flush=True)
 
 
 def _slow_down(lane: int):
@@ -84,7 +118,7 @@ def _slow_down(lane: int):
 
 def fetch(url: str, timeout: int = 40, tries: int = 4) -> str:
     last = None
-    lane = next(_TURN) % len(_LANES)
+    lane = _pick()
     for i in range(tries):
         p = _PACE[lane]
         if p["sleep"] and time.time() < p["until"]:
@@ -100,10 +134,16 @@ def fetch(url: str, timeout: int = 40, tries: int = 4) -> str:
             code = getattr(e, "code", None)
             if code == 404:
                 raise
+            if lane and _proxy_refused(e):
+                if lane not in _DEAD:
+                    _DEAD.add(lane)
+                    print(f"[lanes] a proxy lane refused us; {len(_LANES) - len(_DEAD)} of {len(_LANES)} left", flush=True)
+                lane = _pick()
+                continue
             if code == 429:
                 _slow_down(lane)
                 time.sleep(8 * (i + 1))
-                lane = next(_TURN) % len(_LANES)
+                lane = _pick()
                 continue
             time.sleep(1.5 * (i + 1))
     raise RuntimeError(f"fetch failed {url}: {last}")
@@ -929,6 +969,8 @@ def main():
     s = sub.add_parser("stats")
     s.set_defaults(fn=cmd_stats)
     args = ap.parse_args()
+    if args.cmd in ("crawl", "resolve", "cycle") and len(_LANES) > 1:
+        probe_lanes()
     args.fn(args)
 
 
