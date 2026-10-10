@@ -26,6 +26,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -133,7 +134,63 @@ def db() -> sqlite3.Connection:
     c = sqlite3.connect(DB_PATH, timeout=60)
     c.row_factory = sqlite3.Row
     c.executescript(SCHEMA)
+    if "start_ms" not in [r[1] for r in c.execute("PRAGMA table_info(files)")]:
+        # NULL = not checked yet; 0 = no spoken advert; >0 = where the film begins (see voice_start)
+        c.execute("ALTER TABLE files ADD COLUMN start_ms INTEGER")
+        c.commit()
     return c
+
+
+# ---------------------------------------------------------------- the uploader's spoken advert
+# Some files open with a voice saying "This video downloaded from cinefreak.net" (measured 2026-10-10: 3 of 15
+# files, always inside the first 4.2 s). It is one recording, so it is found by matching the opening's
+# spectrogram against that recording (ad_ref.raw: 8 kHz mono s16le, 3.4 s, cut from a file that has it).
+# Measured on 57 files, every one checked by speech-to-text: the 12 with the voice score 0.56-1.00 (the lowest has
+# music under it), the 45 without score 0.40 or less; 0.5 decides. The film starts 0.2 s after the recording ends.
+AD_REF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ad_ref.raw")
+AD_SR, AD_HOP, AD_N, AD_MATCH = 8000, 80, 256, 0.5
+_AD = None
+
+
+def _spec(a):
+    import numpy as np
+    frames = np.lib.stride_tricks.sliding_window_view(a, AD_N)[::AD_HOP] * np.hanning(AD_N)
+    s = np.log(np.abs(np.fft.rfft(frames, axis=1))[:, 4:100] + 1e-6)   # ~125 Hz to 3.1 kHz: the voice
+    return s - s.mean(1, keepdims=True)
+
+
+def voice_start(url: str) -> int | None:
+    """Where the film begins past the spoken advert, in ms; 0 when there is none; None when it could not be read."""
+    global _AD
+    try:
+        import numpy as np
+        if _AD is None:
+            ref = np.frombuffer(open(AD_REF, "rb").read(), dtype="<i2").astype(np.float32) / 32768
+            r = _spec(ref)
+            _AD = (r - r.mean()) / r.std()
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Range": "bytes=0-3000000"})
+        with urllib.request.urlopen(req, timeout=40) as resp:
+            head = resp.read(3_000_001)
+        p = subprocess.run(["ffmpeg", "-v", "error", "-i", "pipe:0", "-t", "9", "-map", "0:a:0", "-vn", "-ac", "1", "-ar", str(AD_SR), "-f", "s16le", "pipe:1"],
+                           input=head, capture_output=True, timeout=60)
+        pcm = p.stdout[: len(p.stdout) // 2 * 2]
+        if len(pcm) < AD_SR * 2 * 4:
+            return None
+        a = _spec(np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768)
+        L = len(_AD)
+        if len(a) <= L:
+            return None
+        corr = np.empty(len(a) - L)
+        for k in range(len(corr)):                     # normalised correlation at every 10 ms offset
+            x = a[k:k + L]
+            corr[k] = float(((x - x.mean()) * _AD).mean() / (x.std() + 1e-9))
+        i = int(corr.argmax())
+        if corr[i] < AD_MATCH:
+            return 0
+        # the recording's own length past where it starts, plus 0.2 s of quiet
+        return int(round((i * AD_HOP / AD_SR + L * AD_HOP / AD_SR + 0.2) * 1000))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def write_retry(conn: sqlite3.Connection, sql: str, params: tuple, tries: int = 30) -> None:
@@ -544,7 +601,7 @@ def cmd_crawl(args):
 
 
 def resolve_one(fid: str, watch: int) -> tuple[str, dict]:
-    out = {"host": None, "url": None, "sub_url": None, "bytes": None, "err": None}
+    out = {"host": None, "url": None, "sub_url": None, "bytes": None, "err": None, "start_ms": None}
     try:
         f = parse_file_page(fetch(f"https://new5.cinecloud.site/f/{fid}"))
         out.update(f)
@@ -571,6 +628,8 @@ def resolve_one(fid: str, watch: int) -> tuple[str, dict]:
                 out["bytes"] = int(m.group(1)) if m else int(r.headers.get("Content-Length") or 0)
                 if r.status not in (200, 206):
                     out["err"] = f"http {r.status}"
+            if out["host"] == "r2" and not out["err"]:
+                out["start_ms"] = voice_start(out["url"])
     except Exception as e:  # noqa: BLE001
         out["err"] = str(e)[:200]
     return fid, out
@@ -591,7 +650,7 @@ def cmd_resolve(args):
         # one short transaction per batch: the crawl may hold the file most of the time
         for i in range(60):
             try:
-                conn.executemany("UPDATE files SET host=?, url=?, sub_url=?, bytes=?, resolved_at=?, res_err=? WHERE fid=?", pending)
+                conn.executemany("UPDATE files SET host=?, url=?, sub_url=?, bytes=?, resolved_at=?, res_err=?, start_ms=? WHERE fid=?", pending)
                 conn.commit()
                 pending.clear()
                 return
@@ -610,7 +669,7 @@ def cmd_resolve(args):
                 for f in futs: f.cancel()
                 break
             fid, out = fut.result()
-            pending.append((out["host"], out["url"], out["sub_url"], out["bytes"], int(time.time()), out["err"], fid))
+            pending.append((out["host"], out["url"], out["sub_url"], out["bytes"], int(time.time()), out["err"], out["start_ms"], fid))
             n += 1
             if len(pending) >= 25:
                 flush()
@@ -627,7 +686,7 @@ def cmd_resolve(args):
 def title_payload(conn, slug: str) -> dict:
     t = dict(conn.execute("SELECT * FROM titles WHERE slug=?", (slug,)).fetchone())
     eps = [dict(r) for r in conn.execute("SELECT season, ep, name, aired, runtime, lang FROM episodes WHERE slug=? ORDER BY season, ep", (slug,))]
-    files = [dict(r) for r in conn.execute("SELECT fid, season, ep_from, ep_to, quality, hevc, size_mb, label, lang, watch, host, url, sub_url, bytes FROM files WHERE slug=? ORDER BY season, ep_from, quality", (slug,))]
+    files = [dict(r) for r in conn.execute("SELECT fid, season, ep_from, ep_to, quality, hevc, size_mb, label, lang, watch, host, url, sub_url, bytes, COALESCE(start_ms, 0) start_ms FROM files WHERE slug=? ORDER BY season, ep_from, quality", (slug,))]
     return {
         "num": LIB_BASE_NUM + (t["post_id"] or 0), "slug": slug, "type": t["type"], "title": t["title"], "year": t["year"],
         "poster": t["poster"], "overview": t["overview"], "genres": t["genres"], "language": t["language"], "country": t["country"],
@@ -707,9 +766,46 @@ def cmd_push(args):
     return sent
 
 
+def cmd_skipcheck(args):
+    """Files resolved before voice_start existed: check them, newest first, until the deadline or the limit.
+    A file found with the advert gets a fresh resolved_at so its title goes out again; 0 needs no push (the default)."""
+    conn = db()
+    rows = conn.execute(
+        "SELECT f.fid, f.url FROM files f LEFT JOIN titles t ON t.slug=f.slug WHERE f.host='r2' AND f.url IS NOT NULL AND f.start_ms IS NULL "
+        "ORDER BY COALESCE(t.published,'') DESC LIMIT ?", (args.limit,)).fetchall()
+    by = min(deadline_of("RESOLVE"), time.time() + float(os.environ.get("LIB_SKIPCHECK_SECONDS", "900")))
+    print(f"[skip] {len(rows)} files to check", flush=True)
+    found = done = 0
+    ex = ThreadPoolExecutor(max_workers=RCONC)
+    try:
+        futs = {ex.submit(voice_start, r["url"]): r["fid"] for r in rows}
+        for fut in as_completed(futs):
+            if time.time() > by:
+                for f in futs: f.cancel()
+                break
+            ms = fut.result()
+            if ms is None:
+                continue
+            fid = futs[fut]
+            if ms > 0:
+                found += 1
+                write_retry(conn, "UPDATE files SET start_ms=?, resolved_at=? WHERE fid=?", (ms, int(time.time()), fid))
+            else:
+                write_retry(conn, "UPDATE files SET start_ms=0 WHERE fid=?", (fid,))
+            done += 1
+            if done % 50 == 0:
+                conn.commit()
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
+    conn.commit()
+    print(f"[skip] checked {done}, spoken advert in {found}", flush=True)
+
+
 def cmd_cycle(args):
     """One scheduled run: crawl what changed, then resolve and push in rounds until the time budget is spent."""
     cmd_crawl(args)
+    args.limit = 100000
+    cmd_skipcheck(args)
     by = deadline_of("RESOLVE")
     while time.time() < by - 60:
         args.limit = args.round
@@ -751,6 +847,9 @@ def main():
     r = sub.add_parser("resolve")
     r.add_argument("--limit", type=int, default=100000)
     r.set_defaults(fn=cmd_resolve)
+    k = sub.add_parser("skipcheck")
+    k.add_argument("--limit", type=int, default=100000)
+    k.set_defaults(fn=cmd_skipcheck)
     p = sub.add_parser("push")
     p.add_argument("--base")
     p.add_argument("--key")
