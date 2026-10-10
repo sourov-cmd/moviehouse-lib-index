@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 import sqlite3
 import subprocess
 import sys
@@ -54,6 +55,7 @@ def deadline_of(name: str) -> float:
 def say(msg: str, private: str = "") -> None:
     print(msg if QUIET or not private else f"{msg} {private}", flush=True)
 LIB_BASE_NUM = 2_000_000_000
+PARSER = 2   # bump when parse_title changes what it reads: every page is re-read once (see cmd_crawl)
 
 # every category the site's menu lists (2026-10-08); the crawl also follows any /category/ link it meets
 CATEGORIES = [
@@ -329,12 +331,22 @@ def parse_title(html: str, slug: str) -> dict:
     tmdb_id = int(tm.group(2)) if tm else None
     im = re.search(r"imdb\.com/title/(tt\d{6,9})", html)
     imdb_id = im.group(1) if im else None
+    # The title's OWN poster sits in div.poster-image (2026-10-11). The old rule — the first wp-post-image with a
+    # TMDB/cineimg link — skipped a poster the site hosts itself and took a "related" card's instead: 102 of 1,955
+    # titles wore another film's poster (56 the "Happily Married" one). Self-hosted posters are served to the app
+    # through the Library worker's /img/ (the host refuses the app's image loader).
     poster = None
-    for img in soup.select("img.wp-post-image"):
-        src = img.get("src") or ""
-        if "tmdb.org" in src or "cineimg" in src:
+    own = soup.select_one("div.poster-image img")
+    if own:
+        src = (own.get("src") or own.get("data-src") or own.get("data-lazy-src") or "").strip()
+        if src.startswith("http") and "placeholder" not in src:
             poster = src
-            break
+    if not poster:
+        for img in soup.select("img.wp-post-image"):
+            src = img.get("src") or ""
+            if "tmdb.org" in src or "cineimg" in src:
+                poster = src
+                break
     # plot: the paragraph after the "Plot Summary" heading
     overview = None
     for h in soup.select("h3.movie-title"):
@@ -416,7 +428,45 @@ def parse_title(html: str, slug: str) -> dict:
                 "hevc": 1 if re.search(r"hevc|x265|10\s*bit", label, re.I) else 0, "size_mb": _size_mb(label),
                 "label": label, "lang": _lang_tag(label), "watch": 1 if (w and _fid(w.get("href")) == fid) else 0,
             })
+    _settle_title(out, name, h1t)
     return out
+
+
+def _norm(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
+def _named(s: str) -> str | None:
+    """'Ferar Opekkhay (2026) [Bengali] HD 720p' -> 'Ferar Opekkhay'; None when there is no '(year)' to cut at."""
+    m = re.search(r"^(.*?)\s*\((\d{4})\)", s or "")
+    return m.group(1).strip(" -–|") if m else None
+
+
+def _settle_title(out: dict, name: str, h1t: str) -> None:
+    """
+    WHICH NAME IS THE FILM (owner, 2026-10-10: "ভিডিও একটা আর টাইটেলে দেখাচ্ছে আরেকটা").
+    The page's "Full Movie Name" field is a template the uploader fills by hand and sometimes leaves from the post
+    copied (post 54259: field "Look A Like", but H1, <title>, every file label and the files themselves are
+    "Ferar Opekkhay"). The file labels name what is really in the files, so they vote: the H1's name replaces the
+    field's only when more labels carry it. And when the labels name a third film altogether (post 53769: page
+    "Ab Tak Chhappan 2", files "Adarsh Baal Vidyalaya"), those files are not this title's and are dropped rather
+    than shown under the wrong name and poster. Measured on all 1,955 indexed titles: 5 names change, 1 title
+    loses its files; the 22 titles where only an apostrophe or an "[18+]" differs keep the field's name.
+    """
+    labels = [_norm(_named(f["label"]) or "") for f in out["files"] if f.get("season") is None]
+    labels = [x for x in labels if x]
+    if not labels:
+        return
+    def votes(x: str) -> int:
+        x = _norm(x)
+        return sum(1 for l in labels if x and (l.startswith(x) or x.startswith(l))) if x else 0
+    h1_name = _named(h1t)
+    if h1_name and _norm(h1_name) != _norm(out["title"]) and votes(h1_name) > votes(out["title"]):
+        out["title"] = re.sub(r"\s+", " ", h1_name)
+    if len(labels) >= 2 and votes(out["title"]) == 0 and not (h1_name and votes(h1_name)) and not votes(name or ""):
+        out["files"] = [f for f in out["files"] if f.get("season") is not None]
+        out["files_dropped"] = "labels name another film"
 
 
 R2_RE = re.compile(r'https://pub-[a-z0-9]+\.r2\.dev/[^"\'\s<>]+')
@@ -561,6 +611,19 @@ def cmd_crawl(args):
     # pages seen on a card walk but never read (a run that ran out of time) are always picked up
     known = set(slugs)
     for r in conn.execute("SELECT slug FROM titles WHERE fetched_at IS NULL OR (err IS NOT NULL AND fetched_at < ?) ORDER BY rowid DESC", (int(time.time()) - 6 * 3600,)):
+        if r["slug"] not in known:
+            slugs.append(r["slug"]); known.add(r["slug"])
+    # A NEW PARSER RE-READS EVERY PAGE ONCE (2026-10-11: title vote + the title's own poster). The moment this
+    # parser first ran is kept in meta; every page read before it is queued behind the run's normal work, newest
+    # first, and the crawl time budget spreads the re-read over as many runs as it needs. The push then writes
+    # only the titles whose fields really changed.
+    pv = conn.execute("SELECT v FROM meta WHERE k='parser'").fetchone()
+    if not pv or int(pv["v"].split(":")[0]) < PARSER:
+        conn.execute("INSERT INTO meta(k,v) VALUES('parser',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (f"{PARSER}:{int(time.time())}",))
+        conn.commit()
+        pv = conn.execute("SELECT v FROM meta WHERE k='parser'").fetchone()
+    since = int(pv["v"].split(":")[1])
+    for r in conn.execute("SELECT slug FROM titles WHERE fetched_at > 0 AND fetched_at < ? ORDER BY COALESCE(published, '') DESC", (since,)):
         if r["slug"] not in known:
             slugs.append(r["slug"]); known.add(r["slug"])
     # series still airing are re-read on every delta run (new episodes do not move the card)
