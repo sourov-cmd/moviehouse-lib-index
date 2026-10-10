@@ -29,6 +29,7 @@ jobs:
     timeout-minutes: 345
     permissions:
       contents: write
+      actions: write
     env:
       GH_TOKEN: ${{ github.token }}
       LIB_DB: ${{ github.workspace }}/state/index.sqlite
@@ -90,3 +91,21 @@ jobs:
             sha=$(gh api "repos/$GITHUB_REPOSITORY/contents/.keepalive" --jq .sha 2>/dev/null || true)
             gh api -X PUT "repos/$GITHUB_REPOSITORY/contents/.keepalive" -f message="keepalive" -f content="$(date -u +%FT%TZ | base64)" ${sha:+-f sha=$sha} >/dev/null
           fi
+
+      - name: Next run when the hourly schedule is not firing
+        if: ${{ !cancelled() }}
+        run: |
+          # GitHub can take hours (sometimes days) to start the schedule of a new repo, and pauses it in a quiet one.
+          # So when no scheduled run started in the last 3 hours, this run starts the next itself: never sooner than
+          # 55 minutes after this one began (the same hourly pace), and only when no other run is waiting.
+          since=$(date -u -d '-3 hours' +%FT%TZ)
+          sched=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?event=schedule&created=>=$since&per_page=1" --jq '.total_count')
+          if [ "${sched:-0}" -gt 0 ]; then echo "schedule is firing; nothing to do"; exit 0; fi
+          others=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?per_page=20" --jq "[.workflow_runs[] | select(.id != ${{ github.run_id }}) | select(.status==\"queued\" or .status==\"in_progress\" or .status==\"pending\")] | length")
+          if [ "${others:-0}" -gt 0 ]; then echo "another run is waiting; nothing to do"; exit 0; fi
+          start=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/${{ github.run_id }}" --jq .run_started_at)
+          wait=$(( $(date -d "$start" +%s) + 55*60 - $(date +%s) ))
+          [ "$wait" -gt 0 ] && sleep "$wait"
+          gh workflow run sync.yml --repo "$GITHUB_REPOSITORY" --ref main
+          echo "next run started"
+
