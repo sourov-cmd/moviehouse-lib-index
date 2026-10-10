@@ -47,6 +47,9 @@ jobs:
       LIB_RESOLVE_CONCURRENCY: ${{ inputs.resolve_concurrency || '8' }}
       LIB_ROUND: ${{ inputs.round || '1500' }}
       LIB_QUIET: "1"
+      # A second egress lane (owner's Bright Data proxy, 2026-10-11): the source allows ~2 requests/s per IP,
+      # so two lanes resolve about twice as fast. Empty secret = direct line only, exactly as before.
+      LIB_PROXIES: ${{ secrets.LIB_PROXIES }}
       LIB_BASE: ${{ secrets.LIB_INGEST_BASE }}
       LIB_KEY: ${{ secrets.LIB_INGEST_KEY }}
       STATE_KEY: ${{ secrets.LIB_STATE_KEY }}
