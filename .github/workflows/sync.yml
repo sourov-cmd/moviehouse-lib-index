@@ -18,6 +18,15 @@ on:
       crawl_minutes:
         description: "Of which, at most this long reading title pages"
         default: "20"
+      runner:
+        description: "Where to run: ubuntu-latest, or mh-lab (the owner's own server, registered as a self-hosted runner, for a backfill)"
+        default: "ubuntu-latest"
+      resolve_concurrency:
+        description: "Files resolved at once (8 on GitHub; a nearby server with many cores can take far more)"
+        default: "8"
+      round:
+        description: "Files per resolve round (each round is pushed, then the next starts)"
+        default: "1500"
 
 concurrency:
   group: lib-sync
@@ -25,7 +34,8 @@ concurrency:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    # Scheduled runs always use GitHub's machines; only a dispatch may name the self-hosted backfill server.
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 345
     permissions:
       contents: write
@@ -34,7 +44,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       LIB_DB: ${{ github.workspace }}/state/index.sqlite
       LIB_CONCURRENCY: "6"
-      LIB_RESOLVE_CONCURRENCY: "8"
+      LIB_RESOLVE_CONCURRENCY: ${{ inputs.resolve_concurrency || '8' }}
+      LIB_ROUND: ${{ inputs.round || '1500' }}
       LIB_QUIET: "1"
       LIB_BASE: ${{ secrets.LIB_INGEST_BASE }}
       LIB_KEY: ${{ secrets.LIB_INGEST_KEY }}
@@ -70,7 +81,7 @@ jobs:
           fi
 
       - name: Crawl, resolve, push
-        run: python3 cinefreak.py cycle
+        run: python3 cinefreak.py cycle --round "$LIB_ROUND"
 
       - name: Save the state
         if: always()
