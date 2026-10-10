@@ -1,0 +1,90 @@
+name: Library sync
+
+# Every hour: read what changed on the source, resolve the new files, push the difference to the
+# MovieHouse Library index. Public repo = unlimited Actions minutes, so the app's private build
+# minutes are never touched. The crawler's state is kept encrypted (LIB_STATE_KEY) as the one asset
+# of the `state` release; logs print counts only.
+#
+# Secrets: LIB_INGEST_BASE, LIB_INGEST_KEY, LIB_STATE_KEY.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Time budget for this run in minutes (backfill: up to 330)"
+        default: "50"
+      crawl_minutes:
+        description: "Of which, at most this long reading title pages"
+        default: "20"
+
+concurrency:
+  group: lib-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LIB_DB: ${{ github.workspace }}/state/index.sqlite
+      LIB_CONCURRENCY: "6"
+      LIB_RESOLVE_CONCURRENCY: "8"
+      LIB_QUIET: "1"
+      LIB_BASE: ${{ secrets.LIB_INGEST_BASE }}
+      LIB_KEY: ${{ secrets.LIB_INGEST_KEY }}
+      STATE_KEY: ${{ secrets.LIB_STATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet beautifulsoup4 lxml
+
+      - name: Time budget
+        run: |
+          M="${{ inputs.minutes }}"; C="${{ inputs.crawl_minutes }}"
+          M="${M:-50}"; C="${C:-20}"
+          now=$(date +%s)
+          echo "LIB_CRAWL_BY=$((now + C*60))" >> "$GITHUB_ENV"
+          echo "LIB_RESOLVE_BY=$((now + M*60))" >> "$GITHUB_ENV"
+
+      - name: Fetch the state
+        run: |
+          mkdir -p state
+          if gh release download state --repo "$GITHUB_REPOSITORY" --pattern index.sqlite.enc --dir state 2>/dev/null; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:STATE_KEY -in state/index.sqlite.enc -out "$LIB_DB"
+            rm state/index.sqlite.enc
+          elif [ -f bootstrap/index.sqlite.gz.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:STATE_KEY -in bootstrap/index.sqlite.gz.enc | gunzip > "$LIB_DB"
+            echo "state from bootstrap"
+          else
+            echo "::error::no saved state"; exit 1
+          fi
+
+      - name: Crawl, resolve, push
+        run: python3 cinefreak.py cycle
+
+      - name: Save the state
+        if: always()
+        run: |
+          [ -s "$LIB_DB" ] || exit 0
+          python3 cinefreak.py stats | head -6
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:STATE_KEY -in "$LIB_DB" -out state/index.sqlite.enc
+          gh release view state --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create state --repo "$GITHUB_REPOSITORY" --title "state" --notes "Encrypted crawler state, replaced by every run." --latest=false
+          gh release upload state state/index.sqlite.enc --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Keep the schedule alive
+        if: always()
+        run: |
+          # GitHub pauses schedules in a repo with no commit for 60 days; touch a file after 30
+          last=$(gh api "repos/$GITHUB_REPOSITORY/commits?per_page=1" --jq '.[0].commit.committer.date')
+          age=$(( ($(date +%s) - $(date -d "$last" +%s)) / 86400 ))
+          if [ "$age" -ge 30 ]; then
+            sha=$(gh api "repos/$GITHUB_REPOSITORY/contents/.keepalive" --jq .sha 2>/dev/null || true)
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/contents/.keepalive" -f message="keepalive" -f content="$(date -u +%FT%TZ | base64)" ${sha:+-f sha=$sha} >/dev/null
+          fi
