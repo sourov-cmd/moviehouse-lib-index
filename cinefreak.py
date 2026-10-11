@@ -45,7 +45,11 @@ DB_PATH = os.environ.get("LIB_DB", os.path.join(os.path.dirname(os.path.abspath(
 CONC = int(os.environ.get("LIB_CONCURRENCY", "6"))
 RCONC = int(os.environ.get("LIB_RESOLVE_CONCURRENCY", "8"))
 QUIET = os.environ.get("LIB_QUIET") == "1"          # public logs: counts only, never names or links
-DAILY_ROWS = int(os.environ.get("LIB_DAILY_ROWS", "90000"))   # D1 free plan: 100k rows written/day; estimate is ~1.15x real, so ~78k real
+DAILY_ROWS = int(os.environ.get("LIB_DAILY_ROWS", "90000"))   # D1 free plan: 100k rows written/day
+# Rows D1 bills per row the worker reports written (title + files + the search table and its indexes). Measured
+# 2026-10-11: the old 1.7 estimated 43.7k for a morning D1 billed ~99k for (00:00-03:14 UTC), so 4.0 keeps a day's
+# pushes under the free 100k with room for the rest of the day.
+ROW_FACTOR = float(os.environ.get("LIB_ROW_FACTOR", "4.0"))
 
 
 def deadline_of(name: str) -> float:
@@ -847,8 +851,8 @@ def cmd_push(args):
         for p, cost in batch:
             mx = conn.execute("SELECT COALESCE(MAX(resolved_at),0) FROM files WHERE slug=?", (p["slug"],)).fetchone()[0]
             write_retry(conn, "UPDATE titles SET pushed_hash=? WHERE slug=?", (f"{p['hash']}:{mx}", p["slug"]))
-        # the worker's own count of rows it wrote; D1 billed 1.5x that (indexes, search table), measured 2026-10-10
-        used += max(int(int(res.get("written") or 0) * 1.7), len(batch))
+        # the worker's own count of rows it wrote, times what D1 bills per such row (ROW_FACTOR)
+        used += max(int(int(res.get("written") or 0) * ROW_FACTOR), len(batch))
         conn.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (f"rows:{day}", str(spent + used)))
         conn.commit()
         sent += len(batch)
@@ -856,7 +860,7 @@ def cmd_push(args):
         batch = []
 
     for r in rows:
-        cost = int(1.7 * (2 + r["nf"] + r["ne"]))
+        cost = int(ROW_FACTOR * (2 + r["nf"] + r["ne"]))
         if used + sum(c for _, c in batch) + cost > budget:
             break
         batch.append((title_payload(conn, r["slug"]), cost))
