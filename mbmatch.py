@@ -232,7 +232,15 @@ class MovieBox:
 # ---------------------------------------------------------------- the Library's own second copies
 
 def dup_groups(titles: list[dict]) -> dict[int, int]:
-    """num -> the num of the better copy of the same work in the same language."""
+    """num -> the num of the card that stands for the same work in the same language.
+
+    A film: the weaker second copy points at the better one and is simply left out.
+    A series (owner, 2026-10-12: "একই টাইটেল প্রয়োজনের তুলনায় বেশিবার দেখানো হচ্ছে কি না"): the source posts a show
+    season by season ("Game of Thrones" was four cards, "Sweet Home" three), and a later season's post carries that
+    season's year. Every post of one show points at its main card, and the Library worker shows the main card with
+    every season any of them has (per season, the main card's own files first). A post counts as the same show when
+    the title, the language set and the TMDB id agree (the year when no TMDB id is known), so two shows that only
+    share a name stay apart."""
     groups: dict[tuple, list[dict]] = {}
     for t in titles:
         if not t.get("playable") or t.get("adult"):
@@ -240,16 +248,21 @@ def dup_groups(titles: list[dict]) -> dict[int, int]:
         k = key(t["title"])
         if not k:
             continue
-        groups.setdefault((int(t["type"]), k, t.get("year"), frozenset(langs(t.get("language")))), []).append(t)
+        typ = int(t["type"])
+        same = ("tmdb", int(t["tmdb_id"])) if typ == 2 and t.get("tmdb_id") else ("year", t.get("year"))
+        groups.setdefault((typ, k, same, frozenset(langs(t.get("language")))), []).append(t)
     out: dict[int, int] = {}
-    for g in groups.values():
+    for (typ, *_), g in groups.items():
         if len(g) < 2:
             continue
-        g.sort(key=lambda t: (0 if int(t["playable"]) == 1 else 1, -int(t.get("files_n") or 0), -int(t.get("first_seen") or 0), -int(t["num"])))
+        if typ == 2:
+            # the main card: plays directly, carries the most seasons, then the most files, then the newest
+            g.sort(key=lambda t: (0 if int(t["playable"]) == 1 else 1, -len(set(t.get("seasons") or [])), -int(t.get("files_n") or 0),
+                                  -int(t.get("first_seen") or 0), -int(t["num"])))
+        else:
+            g.sort(key=lambda t: (0 if int(t["playable"]) == 1 else 1, -int(t.get("files_n") or 0), -int(t.get("first_seen") or 0), -int(t["num"])))
         best = g[0]
         for t in g[1:]:
-            if int(t["type"]) == 2 and not set(t.get("seasons") or []).issubset(set(best.get("seasons") or [])):
-                continue   # a series post carrying a season the better copy lacks is not a duplicate
             out[int(t["num"])] = int(best["num"])
     return out
 

@@ -78,7 +78,28 @@ class Dups(unittest.TestCase):
             {"num": 4, "type": 2, "title": "Show", "year": 2020, "language": "Hindi", "playable": 1, "files_n": 3, "first_seen": 2, "adult": 0, "seasons": [2]},
             {"num": 5, "type": 2, "title": "Show", "year": 2020, "language": "Hindi", "playable": 1, "files_n": 2, "first_seen": 3, "adult": 0, "seasons": [1]},
         ]
-        self.assertEqual(dup_groups(t), {1: 2, 5: 3})
+        # one card per show: season 2's post (4) joins the main card too, and the worker lists both seasons on it
+        self.assertEqual(dup_groups(t), {1: 2, 4: 3, 5: 3})
+
+    def test_a_show_posted_season_by_season_is_one_card(self):
+        t = [
+            {"num": 10, "type": 2, "title": "XO, Kitty", "year": 2025, "language": "Hindi Dubbed + English (Dual Audio)", "tmdb_id": 195670, "playable": 1, "files_n": 3, "first_seen": 1, "adult": 0, "seasons": [2]},
+            {"num": 11, "type": 2, "title": "XO, Kitty", "year": 2026, "language": "Hindi Dubbed + English (Dual Audio)", "tmdb_id": 195670, "playable": 1, "files_n": 3, "first_seen": 2, "adult": 0, "seasons": [3]},
+            {"num": 12, "type": 2, "title": "The Boys", "year": 2019, "language": "Hindi-English", "tmdb_id": 76479, "playable": 1, "files_n": 24, "first_seen": 1, "adult": 0, "seasons": [1, 2, 3, 4]},
+            {"num": 13, "type": 2, "title": "The Boys", "year": 2026, "language": "Hindi Dubbed + English", "tmdb_id": 76479, "playable": 1, "files_n": 32, "first_seen": 2, "adult": 0, "seasons": [5]},
+        ]
+        self.assertEqual(dup_groups(t), {10: 11, 13: 12})
+
+    def test_shows_that_only_share_a_name_stay_apart(self):
+        t = [
+            {"num": 20, "type": 2, "title": "The Office", "year": 2005, "language": "English", "tmdb_id": 2316, "playable": 1, "files_n": 9, "first_seen": 1, "adult": 0, "seasons": [1]},
+            {"num": 21, "type": 2, "title": "The Office", "year": 2001, "language": "English", "tmdb_id": 2996, "playable": 1, "files_n": 9, "first_seen": 2, "adult": 0, "seasons": [1]},
+            {"num": 22, "type": 2, "title": "Undekhi", "year": 2020, "language": "Hindi", "tmdb_id": 105759, "playable": 1, "files_n": 6, "first_seen": 1, "adult": 0, "seasons": [2]},
+            {"num": 23, "type": 2, "title": "Undekhi", "year": 2020, "language": "Bengali Dubbed", "tmdb_id": 105759, "playable": 1, "files_n": 6, "first_seen": 2, "adult": 0, "seasons": [3]},
+            {"num": 24, "type": 1, "title": "Indian", "year": 1996, "language": "Hindi", "tmdb_id": 1, "playable": 1, "files_n": 4, "first_seen": 1, "adult": 0},
+            {"num": 25, "type": 1, "title": "Indian", "year": 2001, "language": "Hindi", "tmdb_id": 1, "playable": 1, "files_n": 2, "first_seen": 2, "adult": 0},
+        ]
+        self.assertEqual(dup_groups(t), {})
 
     def test_key(self):
         self.assertEqual(key("Wednesday S2"), "wednesday")
