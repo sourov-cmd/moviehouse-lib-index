@@ -158,7 +158,11 @@ def covered_by(t: dict, hits: list[dict]) -> str | None:
         # an original of unknown language covers everything but a Bengali copy MovieBox has no tag for
         keep = "bn" in mine and "bn" not in covered
     else:
-        keep = not mine.issubset(covered)
+        # 2026-10-13 (owner: "যেগুলো Moviebox এ নাই শুধু সেগুলোই ক্যাটাগরিগুলোতে"): a dual-audio copy is the same film
+        # to a viewer as soon as MovieBox plays it in ONE of its languages — Mura (Hindi & Malayalam) beside MovieBox's
+        # [Hindi] showed twice. It stays on the shelves only when MovieBox has none of its languages, or when it
+        # brings Bengali that MovieBox lacks. Search is unchanged: every copy is still found there.
+        keep = not (mine & covered) or ("bn" in mine and "bn" not in covered)
     return None if keep else same[0].get("title")
 
 
@@ -284,11 +288,18 @@ def worker(method: str, path: str, body: dict | None = None) -> dict:
     return {}
 
 
+# The dual-audio rule changed on 2026-10-13 (covered_by): every dual-language copy kept on the shelves under the old
+# rule is asked again once, so the new rule applies everywhere within a day instead of after RECHECK_DAYS.
+RULE_DUAL_TS = 1791835551   # 2026-10-12T20:05Z, when the rule changed
+
+
 def due(t: dict, now: int) -> bool:
     if not t.get("playable") or t.get("adult"):
         return False
     c = int(t.get("checked") or 0)
     if not c:
+        return True
+    if not t.get("mb") and c < RULE_DUAL_TS and len(langs(t.get("language"))) >= 2:
         return True
     age = (now - c) / 86400
     return age >= (RECHECK_MB_DAYS if t.get("mb") else RECHECK_DAYS)
@@ -307,7 +318,10 @@ def cmd_run(args) -> None:
         if (t.get("dup_of") or None) != want_dup:
             flags[n] = {"num": n, "mb": int(t.get("mb") or 0), "dup_of": want_dup, "mb_hit": None, "checked": int(t.get("checked") or 0)}
     todo = [t for t in titles if due(t, now) and int(t["num"]) not in dups]
-    todo.sort(key=lambda t: (int(t.get("checked") or 0) != 0, -int(t.get("first_seen") or 0)))   # never-checked first, newest first
+    # never-checked first, then the dual-audio copies the 2026-10-13 rule must re-decide, then newest first
+    todo.sort(key=lambda t: (int(t.get("checked") or 0) != 0,
+                             not (not t.get("mb") and int(t.get("checked") or 0) < RULE_DUAL_TS and len(langs(t.get("language"))) >= 2),
+                             -int(t.get("first_seen") or 0)))
     todo = todo[: args.budget]
     print(f"[flags] {len(titles)} titles, {len(dups)} second copies, {len(todo)} to ask MovieBox (budget {args.budget})", flush=True)
 

@@ -51,8 +51,13 @@ class LibMergeParity(unittest.TestCase):
         hits = [mb("Khalifa", "2026", "Malayalam"), mb("Khalifa [Hindi]", "2026", "Malayalam")]
         self.assertTrue(covered_by(lib("Khalifa: The Ruler", "2026", "Hindi & Malayalam (Dual Audio)"), hits))
         self.assertIsNone(covered_by(lib("Khalifa: The Ruler", "2019", "Hindi"), hits), "the year still decides")
-        self.assertIsNone(covered_by(lib("Up in the Air", "2009", "Hindi & English (Dual Audio)"), [mb("Up in the Air", "2009", "en")]),
-                          "a Hindi dub MovieBox lacks stays")
+        # 2026-10-13: a dual-audio copy MovieBox plays in one of its languages leaves the shelves (search keeps it)
+        self.assertTrue(covered_by(lib("Up in the Air", "2009", "Hindi & English (Dual Audio)"), [mb("Up in the Air", "2009", "en")]))
+        self.assertTrue(covered_by(lib("Mura", "2024", "Hindi & Malayalam (Dual Audio)"), [mb("Mura [Hindi]", "2024", "Malayalam")]))
+        self.assertIsNone(covered_by(lib("Mura", "2024", "Bengali & Malayalam"), [mb("Mura [Hindi]", "2024", "Malayalam")]),
+                          "Bengali MovieBox lacks keeps a dual copy on the shelves")
+        self.assertIsNone(covered_by(lib("Up in the Air", "2009", "Hindi & Tamil"), [mb("Up in the Air", "2009", "en")]),
+                          "none of its languages on MovieBox: stays")
 
     def test_a_list_of_languages_is_the_original_in_its_first(self):
         # live MovieBox, 2026-10-12: both V for Vendetta copies list "English, French, Latin, Spanish"
