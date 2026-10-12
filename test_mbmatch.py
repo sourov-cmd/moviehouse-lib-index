@@ -47,6 +47,13 @@ class LibMergeParity(unittest.TestCase):
         hits = [mb("Deiva Thirumagal", "2011", "Tamil"), mb("Deiva Thirumagal [Bengali]", "2011", "Tamil")]
         self.assertTrue(covered_by(lib("Nilar Baba", "2011", "Bengali Dubbed", aka="Deiva Thirumagal"), hits))
 
+    def test_a_subtitle_on_either_side(self):
+        hits = [mb("Khalifa", "2026", "Malayalam"), mb("Khalifa [Hindi]", "2026", "Malayalam")]
+        self.assertTrue(covered_by(lib("Khalifa: The Ruler", "2026", "Hindi & Malayalam (Dual Audio)"), hits))
+        self.assertIsNone(covered_by(lib("Khalifa: The Ruler", "2019", "Hindi"), hits), "the year still decides")
+        self.assertIsNone(covered_by(lib("Up in the Air", "2009", "Hindi & English (Dual Audio)"), [mb("Up in the Air", "2009", "en")]),
+                          "a Hindi dub MovieBox lacks stays")
+
     def test_multi_language_catalogue_value_names_nothing(self):
         # MbRegion.language("Tamil, Telugu") == "" -> the row counts as the original
         hits = [mb("Kadaram Kondan", "2019", "Tamil, Telugu")]

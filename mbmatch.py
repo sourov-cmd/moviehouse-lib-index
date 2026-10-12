@@ -118,11 +118,22 @@ def years_close(a, b) -> bool:
     return abs(x - y) <= 1
 
 
+def keys_of(title: str) -> set[str]:
+    """The title's key, and the key of its main name when it carries a subtitle ("Khalifa: The Ruler" is MovieBox's
+    "Khalifa"; checked live 2026-10-12). Only a main name of 4+ letters counts, and the year still has to agree."""
+    out = {key(title)} if key(title) else set()
+    head = re.split(r"\s*:\s+|\s+[-–]\s+", plain_title(title), maxsplit=1)[0]
+    hk = key(head)
+    if len(hk) >= 4:
+        out.add(hk)
+    return out
+
+
 def covered_by(t: dict, hits: list[dict]) -> str | None:
     """The MovieBox title that covers this Library copy (LibMerge.keep says 'drop'), or None (keep it on the shelves)."""
-    keys = {k for k in (key(t["title"]), key(t.get("aka") or "")) if k}
+    keys = keys_of(t["title"]) | (keys_of(t["aka"]) if t.get("aka") else set())
     same = [m for m in hits if m.get("hasResource") and int(m.get("subjectType") or 0) == int(t["type"])
-            and key(m.get("title") or "") in keys and years_close((m.get("releaseDate") or "")[:4], t.get("year"))]
+            and keys & keys_of(m.get("title") or "") and years_close((m.get("releaseDate") or "")[:4], t.get("year"))]
     if not same:
         return None
     covered: set[str] = set()
