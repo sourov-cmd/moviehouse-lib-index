@@ -788,21 +788,137 @@ def cmd_resolve(args):
     return n
 
 
+
+# ---------------------------------------------------------------- what goes out (2026-10-12 audit)
+# Fixes applied when a title is pushed, from what the crawler already holds, so no page is read again for them.
+# REFINE_V bumps re-send, once, only the titles whose payload these rules change (see cmd_push).
+REFINE_V = 1
+
+# Files whose picture was checked by eye and is another work (frames at 15:00 compared, 2026-10-12): the page links a
+# file of a different title. Dropped from the payload; the title's other files stay.
+WRONG_FILES = {
+    "56a2e468": "Pil's Adventures page, file is Mars Needs Moms (2011)",
+    "7bb9e29e": "Koi Sath Hai page, file is Krantiveer (1994)",
+    "5309b1f8": "Neymar page, file is Fyakra (2025, Bengali series)",
+}
+# Pages whose every file is another work: the post is broken at the source (a film page carrying a series' files).
+WRONG_PAGES = {
+    "ab-tak-chhappan-2-2015-full-movie-download": "film page, files are the series Adarsh Baal Vidyalaya (2026)",
+}
+
+
+def other_name(title, card_title):
+    """(display title, aka) from the post's headline "Nilar Baba - Deiva Thirumagal (2026) Bengali Dubbed ..." when the
+    page's own name is one half of it; (title, None) otherwise."""
+    name = _named(card_title or "")
+    if not name or not title:
+        return title, None
+    nt = _norm(title)
+    if not nt or _norm(name) == nt:
+        return title, None
+    m = re.match(r"^(.+?)\s+[-–]\s+(.+)$", name)
+    if m:
+        a, b = m.group(1).strip(), m.group(2).strip()
+        if _norm(b) == nt and _norm(a) and not re.fullmatch(r"\d{4}", _norm(a)):
+            return a, title                   # "Dub name - Original": the dub name is what people search for
+        if _norm(a) == nt and _norm(b) and not re.fullmatch(r"\d{4}", _norm(b)):
+            return title, b
+    m = re.match(r"^(.+?):\s+(.+)$", name)
+    if m:
+        a, b = m.group(1).strip(), m.group(2).strip()
+        if _norm(b) == nt or _norm(a) == nt:
+            other = a if _norm(b) == nt else b
+            if len(_norm(other)) >= 2:
+                return title, other
+    return title, None
+
+
+FILE_EP_RE = re.compile(r"(?<![A-Za-z0-9])[Ss](\d{1,2})[ ._-]?[Ee][Pp]?(\d{1,4})(?:\s*[-–_ ]\s*[Ee]?[Pp]?(\d{1,4}))?(?![0-9])")
+
+
+def file_episodes(url: str | None) -> tuple[int, int] | None:
+    """The episode range a file's own name gives ("Reacher S04E05", "Vikings Valhalla S03E05-08"), or None."""
+    if not url:
+        return None
+    name = urllib.parse.unquote(url.rsplit("/", 1)[-1])
+    m = FILE_EP_RE.search(name)
+    if not m:
+        return None
+    a = int(m.group(2))
+    b = int(m.group(3)) if m.group(3) else a
+    if a <= 0 or b < a or b - a > 60:
+        return None
+    return a, b
+
+
+def refine(t: dict, files: list) -> tuple[str, str | None, list, dict]:
+    """(title, aka, files, what changed) for one title about to be pushed."""
+    changed: dict = {}
+    title, aka = other_name(t["title"], t.get("card_title"))
+    if aka:
+        changed["name"] = [title, aka]
+    out = []
+    if t["slug"] in WRONG_PAGES:
+        changed["wrong_page"] = 1
+        files = []
+    for f in files:
+        if f["fid"] in WRONG_FILES:
+            changed.setdefault("dropped", []).append(f["fid"])
+            continue
+        if f.get("season") is not None and f.get("host") == "r2":
+            # The page's episode number is typed by hand; the file's own name is what the file is
+            # (Reacher S4 "E6" played E5; Vikings: Valhalla S3 E1-4 and E5-8 swapped; Vikram on Duty 4 off).
+            fe = file_episodes(f.get("url"))
+            # A name with one number on a page range ("Part-Timers [S01E21]" for 21-24) names only where a pack
+            # starts: measured, those files run 95-118 min, i.e. the whole range. The page stands then.
+            if fe and fe[0] == fe[1] and (f.get("ep_to") or 0) > (f.get("ep_from") or 0):
+                fe = None
+            if fe and fe != (f.get("ep_from"), f.get("ep_to")):
+                f = {**f, "ep_from": fe[0], "ep_to": fe[1]}
+                changed.setdefault("eps", []).append([f["fid"], fe[0], fe[1]])
+        out.append(f)
+    return title, aka, out, changed
+
 # ---------------------------------------------------------------- push
 
 def title_payload(conn, slug: str) -> dict:
     t = dict(conn.execute("SELECT * FROM titles WHERE slug=?", (slug,)).fetchone())
     eps = [dict(r) for r in conn.execute("SELECT season, ep, name, aired, runtime, lang FROM episodes WHERE slug=? ORDER BY season, ep", (slug,))]
     files = [dict(r) for r in conn.execute("SELECT fid, season, ep_from, ep_to, quality, hevc, size_mb, label, lang, watch, host, url, sub_url, bytes, COALESCE(start_ms, 0) start_ms FROM files WHERE slug=? ORDER BY season, ep_from, quality", (slug,))]
+    title, aka, files, changed = refine(t, files)
+    # the worker writes a title only when this hash moves: a refinement adds its own short digest, so a refined title
+    # is written once and an untouched one keeps the exact hash it had (no rewrite of the other ~10,000)
+    h = t["hash"] + ("~" + hashlib.sha1(json.dumps(changed, sort_keys=True).encode()).hexdigest()[:8] if changed else "")
     return {
-        "num": LIB_BASE_NUM + (t["post_id"] or 0), "slug": slug, "type": t["type"], "title": t["title"], "year": t["year"],
+        "num": LIB_BASE_NUM + (t["post_id"] or 0), "slug": slug, "type": t["type"], "title": title, "aka": aka, "year": t["year"], "_base_hash": t["hash"],
         "poster": t["poster"], "overview": t["overview"], "genres": t["genres"], "language": t["language"], "country": t["country"],
         "rating": t["rating"], "releaseDate": t["release_date"], "runtime": t["runtime"], "tmdbId": t["tmdb_id"], "imdbId": t["imdb_id"], "status": t["status"],
-        "cats": t["cats"], "ott": t["ott"], "badges": t["badges"], "published": t["published"], "modified": t["modified"], "hash": t["hash"], "episodes": eps, "files": files,
+        "cats": t["cats"], "ott": t["ott"], "badges": t["badges"], "published": t["published"], "modified": t["modified"], "hash": h, "episodes": eps, "files": files,
     }
 
 
 PLAYABLE_HOSTS = ("r2", "gu")
+
+
+def resend_refined(conn) -> None:
+    """Once per REFINE_V: titles already pushed whose payload the refine rules change go out again (counts only)."""
+    have = int((conn.execute("SELECT v FROM meta WHERE k='refine_v'").fetchone() or [0])[0])
+    if have >= REFINE_V:
+        return
+    n = 0
+    kinds: dict = {}
+    for r in conn.execute("SELECT slug FROM titles WHERE pushed_hash IS NOT NULL").fetchall():
+        p = title_payload(conn, r["slug"])
+        if p["hash"] != p["_base_hash"]:
+            changed = refine(dict(conn.execute("SELECT * FROM titles WHERE slug=?", (r["slug"],)).fetchone()),
+                             [dict(x) for x in conn.execute("SELECT fid, season, ep_from, ep_to, host, url FROM files WHERE slug=?", (r["slug"],))])[3]
+            for k in changed:
+                kinds[k] = kinds.get(k, 0) + 1
+            conn.execute("UPDATE titles SET pushed_hash=NULL WHERE slug=?", (r["slug"],))
+            n += 1
+    conn.execute("INSERT INTO meta(k,v) VALUES('refine_v',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(REFINE_V),))
+    conn.commit()
+    print(f"[refine] v{REFINE_V}: {n} titles go out again {json.dumps(kinds, sort_keys=True)}", flush=True)
 
 
 def cmd_push(args):
@@ -812,6 +928,7 @@ def cmd_push(args):
     if not base or not key:
         sys.exit("need --base and --key (or LIB_BASE / LIB_KEY)")
     day = time.strftime("%Y-%m-%d", time.gmtime())
+    resend_refined(conn)
     spent = int((conn.execute("SELECT v FROM meta WHERE k=?", (f"rows:{day}",)).fetchone() or [0])[0])
     budget = DAILY_ROWS - spent
     if budget <= 0:
@@ -835,7 +952,7 @@ def cmd_push(args):
         nonlocal batch, sent, used
         if not batch:
             return
-        body = json.dumps({"titles": [b[0] for b in batch]}).encode()
+        body = json.dumps({"titles": [{k: v for k, v in b[0].items() if not k.startswith("_")} for b in batch]}).encode()
         req = urllib.request.Request(base + "/ingest", data=body, method="POST", headers={"content-type": "application/json", "x-lib-key": key, "user-agent": "MovieHouse-LibIndex/2"})
         for i in range(4):
             try:
@@ -850,7 +967,7 @@ def cmd_push(args):
             raise RuntimeError(f"ingest: {str(res)[:300]}")
         for p, cost in batch:
             mx = conn.execute("SELECT COALESCE(MAX(resolved_at),0) FROM files WHERE slug=?", (p["slug"],)).fetchone()[0]
-            write_retry(conn, "UPDATE titles SET pushed_hash=? WHERE slug=?", (f"{p['hash']}:{mx}", p["slug"]))
+            write_retry(conn, "UPDATE titles SET pushed_hash=? WHERE slug=?", (f"{p['_base_hash']}:{mx}", p["slug"]))
         # the worker's own count of rows it wrote, times what D1 bills per such row (ROW_FACTOR)
         used += max(int(int(res.get("written") or 0) * ROW_FACTOR), len(batch))
         conn.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (f"rows:{day}", str(spent + used)))

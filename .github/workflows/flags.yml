@@ -1,0 +1,39 @@
+name: Library shelf flags
+
+# Which Library titles MovieBox already plays (and which are a weaker second copy), so the app's Library shelves and
+# platform grids list only what MovieBox does not (owner, 2026-10-12). See mbmatch.py. Public repo = free minutes.
+# Each run asks MovieBox about at most `budget` titles: new ones first, then the oldest checks. Logs print counts only.
+#
+# Secrets: LIB_INGEST_BASE (the Library worker), LIB_FLAGS_KEY, MB_RECIPE (the "mobile" block of the app's recipe).
+
+on:
+  schedule:
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      budget:
+        description: "Titles to ask MovieBox about in this run"
+        default: "1200"
+      minutes:
+        description: "Time budget in minutes"
+        default: "25"
+
+concurrency:
+  group: lib-flags
+  cancel-in-progress: false
+
+jobs:
+  flags:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      LIB_BASE: ${{ secrets.LIB_INGEST_BASE }}
+      FLAGS_KEY: ${{ secrets.LIB_FLAGS_KEY }}
+      MB_RECIPE: ${{ secrets.MB_RECIPE }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 -m unittest test_mbmatch
+      - run: python3 mbmatch.py run --budget "${{ inputs.budget || '1200' }}" --minutes "${{ inputs.minutes || '25' }}"
