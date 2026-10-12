@@ -103,10 +103,19 @@ def mb_region_language(raw: str | None) -> str:
 
 
 def moviebox_langs(hit: dict) -> set[str]:
-    """LibMerge.movieBoxLangs: the [Hindi] edition tag, else the catalogue language."""
+    """LibMerge.movieBoxLangs: the [Hindi] edition tag, else the catalogue language. Empty = an original whose language
+    is unknown (covers every language but Bengali, as in the app)."""
     m = re.search(r"\[([^\]]+)\]", hit.get("title") or "")
     tag = langs(m.group(1)) if m else set()
-    return tag or langs(mb_region_language(hit.get("language")))
+    if tag:
+        return tag
+    # SHELVES ONLY, stricter than the phone (2026-10-12): an untagged copy is the ORIGINAL, and MovieBox's `language`
+    # for it is often a list of the film's spoken languages ("English, French, Latin, Spanish"). The phone's
+    # MbRegion.language turns a list into "" and, beside a [Hindi] copy, the original then counted for nothing:
+    # V for Vendetta (Hindi & English) stayed on the shelf although MovieBox plays both. The first language listed
+    # is the original's audio, so that is the one it covers. Search is unaffected (the phone keeps its own rule).
+    raw = (hit.get("language") or "").split(",")[0]
+    return langs(mb_region_language(raw))
 
 
 def years_close(a, b) -> bool:
@@ -137,13 +146,17 @@ def covered_by(t: dict, hits: list[dict]) -> str | None:
     if not same:
         return None
     covered: set[str] = set()
+    unknown_original = False
     for m in same:
-        covered |= moviebox_langs(m)
+        got = moviebox_langs(m)
+        covered |= got
+        unknown_original = unknown_original or not got
     mine = langs(t.get("language"))
     if not mine:
         keep = False
-    elif not covered:
-        keep = "bn" in mine
+    elif unknown_original:
+        # an original of unknown language covers everything but a Bengali copy MovieBox has no tag for
+        keep = "bn" in mine and "bn" not in covered
     else:
         keep = not mine.issubset(covered)
     return None if keep else same[0].get("title")

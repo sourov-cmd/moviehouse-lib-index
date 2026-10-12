@@ -54,10 +54,19 @@ class LibMergeParity(unittest.TestCase):
         self.assertIsNone(covered_by(lib("Up in the Air", "2009", "Hindi & English (Dual Audio)"), [mb("Up in the Air", "2009", "en")]),
                           "a Hindi dub MovieBox lacks stays")
 
-    def test_multi_language_catalogue_value_names_nothing(self):
-        # MbRegion.language("Tamil, Telugu") == "" -> the row counts as the original
+    def test_a_list_of_languages_is_the_original_in_its_first(self):
+        # live MovieBox, 2026-10-12: both V for Vendetta copies list "English, French, Latin, Spanish"
+        hits = [mb("V for Vendetta [Hindi]", "2006", "English, French, Latin, Spanish"), mb("V for Vendetta", "2006", "English, French, Latin, Spanish")]
+        self.assertTrue(covered_by(lib("V for Vendetta", "2006", "Hindi & English (Dual Audio)"), hits))
+        self.assertIsNone(covered_by(lib("V for Vendetta", "2006", "Bengali"), hits))
         hits = [mb("Kadaram Kondan", "2019", "Tamil, Telugu")]
-        self.assertTrue(covered_by(lib("Kadaram Kondan", "2019", "Hindi"), hits) is not None)
+        self.assertTrue(covered_by(lib("Kadaram Kondan", "2019", "Tamil"), hits))
+        self.assertIsNone(covered_by(lib("Kadaram Kondan", "2019", "Hindi"), hits), "a Hindi dub MovieBox lacks stays")
+
+    def test_unknown_original_beside_a_tagged_copy(self):
+        hits = [mb("Jawan", "2023", None), mb("Jawan [Bengali]", "2023", None)]
+        self.assertTrue(covered_by(lib("Jawan", "2023", "Bangla Dubbed"), hits))
+        self.assertTrue(covered_by(lib("Jawan", "2023", "Hindi"), hits))
 
 
 class Dups(unittest.TestCase):
