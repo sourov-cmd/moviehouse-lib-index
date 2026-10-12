@@ -1050,6 +1050,12 @@ def cmd_stats(args):
           "pushed", q("SELECT COUNT(*) FROM titles WHERE pushed_hash IS NOT NULL"))
     for r in conn.execute("SELECT host, COUNT(*) n FROM files GROUP BY host"):
         print("  host", r["host"], r["n"])
+    # why a post is not in the app (counts only): no file link at all, only Drive files the host gives no direct
+    # copy of, files not resolved yet, or the page failed to read
+    print("not in the app: no files", q("SELECT COUNT(*) FROM titles t WHERE fetched_at>0 AND NOT EXISTS(SELECT 1 FROM files f WHERE f.slug=t.slug)"),
+          "| only unplayable hosts", q("SELECT COUNT(*) FROM titles t WHERE EXISTS(SELECT 1 FROM files f WHERE f.slug=t.slug) AND NOT EXISTS(SELECT 1 FROM files f WHERE f.slug=t.slug AND (f.host IN ('r2','gu') OR f.resolved_at IS NULL))"),
+          "| waiting to resolve", q("SELECT COUNT(DISTINCT slug) FROM files WHERE resolved_at IS NULL"),
+          "| page errors", q("SELECT COUNT(*) FROM titles WHERE err IS NOT NULL"))
     for r in conn.execute("SELECT year, COUNT(*) n, SUM(CASE WHEN EXISTS(SELECT 1 FROM files f WHERE f.slug=t.slug AND f.host='r2') THEN 1 ELSE 0 END) r2 FROM titles t WHERE fetched_at>0 GROUP BY year ORDER BY year DESC LIMIT 12"):
         print("  year", r["year"], r["n"], "with r2:", r["r2"])
 
