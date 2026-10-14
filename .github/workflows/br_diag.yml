@@ -1,0 +1,26 @@
+name: Browser pass diagnosis (throwaway)
+# Viktor 2026-10-14: why the runner got no buttons in the browser test. No state, no push. Delete when done.
+on:
+  push:
+    branches: [viktor/cf-browser]
+    paths: ["probe/br_diag.py", ".github/workflows/br_diag.yml"]
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LIB_DB: /tmp/diag.sqlite
+      LIB_QUIET: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: |
+          pip install --quiet beautifulsoup4 lxml numpy patchright
+          python -m patchright install --with-deps chromium >/dev/null
+      - run: cd probe && xvfb-run -a python br_diag.py "$FIDS" 2>&1 | grep -v -E "ERROR|inotify|dbus" || true
+        env:
+          FIDS: 2Rbr8JRHgrjY9TWZcqJJscXsKP3dgXCbz3zniwRjrliSXJf3fRsoHehcbDoO0w,JoWvOhNRyZXYwd5cecpoFBOTMpBrvJ9q3a4pc_LJZUN2ViWIbGU2z3dKIC65nQ,EUd002rGIsEdko4qcbdDex3BmNGPmBG3RrwuhptHXN0xbJtCiruYXttzjNRYPg,H1QRBy_LmFbzGwXWe477gFr-cZZJZWxxxthQvjUw1xZgqMsrQoccBkGcAXOA6A,O6yXv9uD7FYjfz61ZVlYQKVZnX5WAjUGR1W3P6wwlGm_-s3iOqifR5jzwDazIg,z-Sk123a1HI4QzHO7zPVVYXpMcMHIcxsv52OEF8H6a4vkDmSn_okew4IWxXSiw
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: diag, path: /tmp/out, retention-days: 1 }
