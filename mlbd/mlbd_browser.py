@@ -8,7 +8,11 @@ fingerprint are used. Proven on GitHub runners 2026-10-13/14 (runs 38497631606, 
 Known traps (all handled here):
   * The site sets one tiny cookie per title page viewed; after ~1,400 pages the Cookie header is too big and every
     request answers 400 "Request Header Or Cookie Too Large". prune() drops every cookie that was not present
-    right after the challenge (cf_clearance is kept), every PRUNE_EVERY requests and on any 400.
+    right after the FIRST challenge (Cloudflare's own cf_* / __cf* cookies are always kept). It runs from tidy(),
+    which the crawler calls between titles (never between a title page and its /file/ links), and on any 400.
+    Fixed 2026-10-14 (production run 38585196510): a mid-run re-open used to add every per-title cookie to the
+    kept set, so pruning stopped working and 10,932 requests answered 400. A second "too large" in a row now
+    clears everything but Cloudflare's cookies.
   * A challenge can come back mid-run (403/503 "Just a moment"): re-open the home page, solve, retry.
   * 429: back off.
 """
@@ -39,6 +43,7 @@ class Session:
         self.errors = collections.Counter()
         self.keep = set()
         self.since_prune = 0
+        self.big_streak = 0
         self.lock = asyncio.Lock()
 
     async def solve(self):
@@ -69,17 +74,23 @@ class Session:
             except Exception as e:
                 self.errors["goto:" + type(e).__name__] += 1
             if await self.solve():
-                names = {c["name"] for c in await self.ctx.cookies()}
-                self.keep |= names
+                if not self.keep:   # only the first challenge decides what is kept (see the module note)
+                    self.keep = {c["name"] for c in await self.ctx.cookies()}
                 return True
             await asyncio.sleep(10 * (attempt + 1))
         return False
 
-    async def prune(self):
+    @staticmethod
+    def _cf(name):
+        return name.startswith("cf_") or name.startswith("__cf") or name.startswith("_cf")
+
+    async def prune(self, hard=False):
         cs = await self.ctx.cookies()
-        if len(cs) <= len(self.keep) + 5:
+        self.since_prune = 0
+        if not hard and len(cs) <= len(self.keep) + 5:
             return
-        kept = [c for c in cs if c["name"] in self.keep]
+        self.errors["prune_hard" if hard else "prune"] += 1
+        kept = [c for c in cs if self._cf(c["name"]) or (not hard and c["name"] in self.keep)]
         await self.ctx.clear_cookies()
         if kept:
             await self.ctx.add_cookies(kept)
@@ -101,8 +112,6 @@ class Session:
             if not todo:
                 break
             async with self.lock:
-                if self.since_prune >= PRUNE_EVERY:
-                    await self.prune()
                 try:
                     res = await self._fetch([full[i] for i in todo])
                 except Exception as e:
@@ -127,8 +136,11 @@ class Session:
                     out[i] = (st, txt, r[2])
             if big:
                 self.errors["cookie_too_large"] += 1
+                self.big_streak += 1
                 async with self.lock:
-                    await self.prune()
+                    await self.prune(hard=self.big_streak > 1)
+            else:
+                self.big_streak = 0
             if challenge:
                 await self.open()
             if slow:
@@ -139,6 +151,12 @@ class Session:
         for i in todo:
             out[i] = (-1, "", full[i])
         return out
+
+    async def tidy(self):
+        """Drop the per-title cookies every PRUNE_EVERY requests; call it only between titles."""
+        if self.since_prune >= PRUNE_EVERY:
+            async with self.lock:
+                await self.prune()
 
     async def get(self, url, pace=0.0):
         return (await self.get_many([url], pace))[0]

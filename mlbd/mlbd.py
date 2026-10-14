@@ -367,6 +367,7 @@ async def do_crawl(s, conn, limit: int) -> int:
             say(f"[crawl] time budget reached at {done}/{len(paths)}")
             break
         part = paths[i:i + BATCH]
+        await s.tidy()
         res = await s.get_many(part, PACE)
         for p, (st, x, fin) in zip(part, res):
             done += 1
@@ -375,6 +376,7 @@ async def do_crawl(s, conn, limit: int) -> int:
                 continue
             if store_title(conn, parse_title(x), p):
                 changed += 1
+            FRESH[p] = time.time()
         if done % 40 < BATCH:
             conn.commit()
             print(f"[crawl] {done}/{len(paths)} ({changed} changed) req={s.nreq}", flush=True)
@@ -419,39 +421,73 @@ async def resolve_file(s, aurl: str) -> tuple[str | None, str | None]:
     return (unescape(d[0]), None) if d else (None, "no direct link")
 
 
+# A title's /file/ links change with every page view and stop working after a while: production run 38585196510
+# read 3,988 pages first and opened their links ~2 hours later, and all 8,948 answered a page without any download
+# host ("no fsl ()"), while a test that opened them right after reading passed 176/176. So resolve re-reads a title
+# page right before opening its links, unless this run read it less than FRESH_S seconds ago.
+FRESH: dict[str, float] = {}
+FRESH_S = int(os.environ.get("MLBD_FRESH_S", "600"))
+
+
+def reset_stale_once(conn) -> None:
+    """One-time (2026-10-14): retry what the stale-link bug and the cookie bug marked as failed, now, not in 24 hours."""
+    if conn.execute("SELECT v FROM meta WHERE k='reset_stale_20261014'").fetchone():
+        return
+    a = conn.execute("UPDATE files SET resolved_at=NULL, res_err=NULL WHERE host IS NULL AND "
+                     "(res_err LIKE 'no fsl ()%' OR res_err LIKE 'A http -1%' OR res_err LIKE 'A http 400%')").rowcount
+    b = conn.execute("UPDATE items SET fetched_at=NULL, err=NULL WHERE err IN ('http 400', 'http -1')").rowcount
+    meta_set(conn, "reset_stale_20261014", f"{a},{b}")
+    conn.commit()
+    print(f"[reset] {a} files and {b} pages will be retried", flush=True)
+
+
 async def do_resolve(s, conn, limit: int) -> int:
     rows = conn.execute(
-        "SELECT f.fid, f.aurl FROM files f JOIN items i ON i.path=f.path WHERE f.aurl IS NOT NULL AND "
+        "SELECT f.fid, f.path, f.aurl FROM files f JOIN items i ON i.path=f.path WHERE f.aurl IS NOT NULL AND "
         "(f.resolved_at IS NULL OR (f.res_err IS NOT NULL AND f.res_err NOT LIKE 'archive%' AND f.resolved_at < ?)) "
         "ORDER BY COALESCE(i.lastmod,'') DESC, f.quality=720 DESC, f.quality DESC LIMIT ?", (int(time.time()) - 86400, limit)).fetchall()
     only = os.environ.get("MLBD_ONLY")   # a test resolves just the kind it read
     if only:
-        rows = conn.execute("SELECT fid, aurl FROM files WHERE aurl IS NOT NULL AND resolved_at IS NULL AND path LIKE ? LIMIT ?", (only + "%", limit)).fetchall()
+        rows = conn.execute("SELECT fid, path, aurl FROM files WHERE aurl IS NOT NULL AND resolved_at IS NULL AND path LIKE ? LIMIT ?", (only + "%", limit)).fetchall()
     by = deadline("RESOLVE")
     print(f"[resolve] {len(rows)} files", flush=True)
     n, stat = 0, {}
+    refetched = 0
     for r in rows:
         if time.time() > by:
             say(f"[resolve] time budget reached at {n}/{len(rows)}")
             break
+        path = r["path"]
+        if time.time() - FRESH.get(path, 0) > FRESH_S:
+            await s.tidy()
+            st, x, _ = await s.get(path, PACE)
+            FRESH[path] = time.time()   # once per title per run, even when it failed
+            refetched += 1
+            if st == 200:
+                store_title(conn, parse_title(x), path)
+            else:
+                conn.execute("UPDATE items SET fetched_at=?, err=? WHERE path=?", (int(time.time()), f"http {st}", path))
+        cur = conn.execute("SELECT aurl FROM files WHERE fid=?", (r["fid"],)).fetchone()
+        if not cur or not cur["aurl"]:
+            continue   # the button is gone from the page: store_title deleted the file
         url, err, size, name = None, None, None, None
         try:
-            url, err = await resolve_file(s, r["aurl"])
+            url, err = await resolve_file(s, cur["aurl"])
             if url:
                 size, name, err = await asyncio.to_thread(check_direct, url)
         except Exception as e:  # noqa: BLE001
             err = str(e)[:150]
         host = "r2" if url and not err else None
-        key = "ok" if host else (err or "?").split(" ")[0]
+        key = "ok" if host else " ".join((err or "?").split(" ")[:2])
         stat[key] = stat.get(key, 0) + 1
         conn.execute("UPDATE files SET host=?, url=?, bytes=?, fname=?, resolved_at=?, res_err=? WHERE fid=?",
                      (host, url if host else None, size, name, int(time.time()), err, r["fid"]))
         n += 1
         if n % 20 == 0:
             conn.commit()
-            print(f"[resolve] {n}/{len(rows)} {json.dumps(stat, sort_keys=True)} req={s.nreq}", flush=True)
+            print(f"[resolve] {n}/{len(rows)} {json.dumps(stat, sort_keys=True)} re-read {refetched} req={s.nreq}", flush=True)
     conn.commit()
-    print(f"[resolve] done {n} {json.dumps(stat, sort_keys=True)}", flush=True)
+    print(f"[resolve] done {n} {json.dumps(stat, sort_keys=True)} re-read {refetched}", flush=True)
     return n
 
 
@@ -571,6 +607,7 @@ async def run(args) -> None:
             sys.exit(2)
         print("[mlbd] challenge passed", flush=True)
         try:
+            reset_stale_once(conn)
             if args.cmd in ("index", "cycle"):
                 await do_index(s, conn, getattr(args, "shards", False) or not conn.execute("SELECT 1 FROM items LIMIT 1").fetchone(), args.listing)
             if args.cmd == "crawl":
