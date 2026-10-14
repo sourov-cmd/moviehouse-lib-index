@@ -41,10 +41,19 @@ async def main():
                if not ADS.search(r.url) and "challenges.cloudflare" not in r.url and "/assets/" not in r.url and "cdn-cgi" not in r.url else None)
         downloads = []
         ctx.on("download", lambda d: downloads.append(d.url[:600]))
+        async def click_ts(pg):
+            for fr in pg.frames:
+                if "challenges.cloudflare.com" in fr.url:
+                    try:
+                        box = await (await fr.frame_element()).bounding_box()
+                        if box: await pg.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
+                    except Exception: pass
         async def solve(pg):
             for i in range(60):
                 if "moment" not in (await pg.title()).lower(): return True
                 await asyncio.sleep(2)
+                if i in (4, 10, 18, 28):
+                    await click_ts(pg)
             return False
         async def unlock(tok):
             await page.goto(HOST + "/f/" + tok, timeout=90000); await solve(page)
@@ -52,6 +61,7 @@ async def main():
                 c = await page.evaluate("() => { const e=document.getElementById('download-buttons-container'); return e ? e.innerHTML : ''; }")
                 if 'cf-ts-box' not in c and c.strip(): return c
                 await asyncio.sleep(1)
+                if i in (20, 40): await click_ts(page)
             return ""
         meta_js = "() => ({title: document.title, size: (document.body.innerText.match(/\\d+(\\.\\d+)?\\s*(GB|MB)/)||[''])[0]})"
         results = []
@@ -93,6 +103,7 @@ async def main():
                 for pg in newp:
                     try: await pg.close()
                     except Exception: pass
+            print("file", n, "unlock_s", rec["unlock_s"], "title", meta.get("title", "")[:30], "buttons", len(btns))
             results.append(rec)
         json.dump(results, open(f"{OUT}/follow.json", "w"), indent=1)
         await ctx.close()
