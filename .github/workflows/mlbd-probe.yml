@@ -1,19 +1,7 @@
-name: mlbd runner probe
-# Viktor 2026-10-14: one-off test on a throwaway branch: does a free GitHub runner pass movielinkbd's challenge?
-on:
-  push:
-    branches: [viktor-mlbd-probe]
-  workflow_dispatch:
+name: mlbd probe (old, manual only)
+on: workflow_dispatch
 jobs:
-  probe:
+  noop:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
-      - run: pip install --quiet patchright && python -m patchright install --with-deps chromium
-      - run: cd probe && xvfb-run -a python sample_gh.py 300 10
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with: { name: shot, path: /tmp/shot.png, retention-days: 1 }
+      - run: echo "superseded by probe.yml"
