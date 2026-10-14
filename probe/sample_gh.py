@@ -62,7 +62,8 @@ async def main():
         st, m = await get(base + "/search-suggest/manifest"); man = json.loads(m)
         print("manifest keys:", sorted(man.keys())[:20])
         rows = {}
-        shards = man.get("shards") or man.get("keys") or [a + b for a in string.ascii_lowercase + string.digits for b in string.ascii_lowercase + string.digits]
+        print("manifest:", {k: man[k] for k in man if k not in ("discovery", "catalog_probe")}, "discovery:", str(man.get("discovery"))[:200])
+        shards = [a + b for a in string.ascii_lowercase + string.digits for b in string.ascii_lowercase + string.digits]
         t0 = time.time()
         for k in shards:
             st, x = await get(f"{base}/assets/search-suggest/v{man['v']}/{k}.json")
