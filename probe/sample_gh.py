@@ -121,4 +121,4 @@ async def main():
         print("status counts", dict(stats), "fetch errors", dict(errs.most_common(5)))
         print("total requests", nreq, "time", round(time.time() - t0), "s")
         await ctx.close()
-asyncio.run(main())
+if __name__ == "__main__": asyncio.run(main())
