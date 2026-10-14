@@ -281,7 +281,10 @@ def max_page(html: str) -> int:
     return max(pages) if pages else 1
 
 
-_FID = re.compile(r"cinecloud\.site/([fxwd])/([a-z0-9]+)")
+# 2026-10-14: the host's file codes grew from 8 lowercase characters to ~62 mixed-case ones ('utrZO3Qk...-T_g0...').
+# The old [a-z0-9]+ cut them at the first capital ('utr', '2', 'x'): files got wrong codes that collide across titles
+# (2,309 such rows in the Library, every one unplayable), and their /f/ pages could not open.
+_FID = re.compile(r"cinecloud\.site/([fxwd])/([A-Za-z0-9_-]+)")
 
 
 def _fid(href: str | None) -> str | None:
@@ -670,6 +673,17 @@ def cmd_crawl(args):
     for r in conn.execute("SELECT slug FROM titles WHERE fetched_at > 0 AND fetched_at < ? ORDER BY COALESCE(published, '') DESC", (since,)):
         if r["slug"] not in known:
             slugs.append(r["slug"]); known.add(r["slug"])
+    # ONCE (fidfix): every title holding a file code cut by the old pattern, or a file never classified, is read again
+    # so its files get their full codes; the push then replaces the cut rows in the Library (ingest drops a title's
+    # files that are no longer sent).
+    if not conn.execute("SELECT 1 FROM meta WHERE k='fidfix'").fetchone():
+        for r in conn.execute("SELECT DISTINCT f.slug FROM files f LEFT JOIN titles t ON t.slug=f.slug "
+                              "WHERE (length(f.fid) < 20 AND length(f.fid) != 8) OR f.host IN ('unknown','wall') OR f.res_err IS NOT NULL "
+                              "ORDER BY COALESCE(t.published, '') DESC"):
+            if r["slug"] and r["slug"] not in known:
+                slugs.append(r["slug"]); known.add(r["slug"])
+        conn.execute("INSERT INTO meta(k,v) VALUES('fidfix',?)", (str(int(time.time())),))
+        conn.commit()
     # series still airing are re-read on every delta run (new episodes do not move the card)
     if not args.full:
         for r in conn.execute("SELECT slug FROM titles WHERE type='tv' AND (status IS NULL OR status NOT LIKE '%All Episodes%') AND fetched_at < ?", (int(time.time()) - args.series_recheck_hours * 3600,)):
@@ -710,7 +724,7 @@ def cmd_crawl(args):
 def resolve_one(fid: str, watch: int) -> tuple[str, dict]:
     out = {"host": None, "url": None, "sub_url": None, "bytes": None, "err": None, "start_ms": None}
     try:
-        f = parse_file_page(fetch(f"https://new5.cinecloud.site/f/{fid}"))
+        f = parse_file_page(fetch(f"https://new5.cinecloud.site/f/{fid}", tries=2))
         out.update(f)
         if f["host"] == "gd":
             # A Drive copy: '/w/<fid>' names a fresh googleusercontent link (works from any network, no
@@ -738,8 +752,152 @@ def resolve_one(fid: str, watch: int) -> tuple[str, dict]:
             if out["host"] == "r2" and not out["err"]:
                 out["start_ms"] = voice_start(out["url"])
     except Exception as e:  # noqa: BLE001
-        out["err"] = str(e)[:200]
+        if getattr(e, "code", None) == 403 or "HTTP Error 403" in str(e):
+            # 2026-10-14: the file host shows a Turnstile page to every plain request since 2026-10-11; such a file
+            # waits for the browser pass (cmd_bresolve) instead of failing again every run
+            out["host"], out["err"] = "wall", None
+        else:
+            out["err"] = str(e)[:200]
     return fid, out
+
+
+# ---------------------------------------------------------------- the browser pass (2026-10-14)
+# Since 2026-10-11 '/f/<fid>' answers a plain request with Turnstile. A real browser (patchright, under xvfb) passes
+# it in ~10 s and the page then shows its buttons. Measured 2026-10-14: on most 720p/1080p film files the
+# "FAST CLOUD [FSL]" button is the same public R2 link as before (pub-*.r2.dev, ranged 206, no token): it is kept,
+# exactly as the old resolve kept it. 480p files and the newest series episodes carry only "FAST CLOUD [V2]" (a
+# vidzer ticket bound to the browser, expires in 6 h) or a Drive copy: nothing permanent, so they are kept as 'v2'
+# or 'gd' and never offered for play. Pages are opened one after another (one tab): the host is never hammered.
+BR_HOST = "https://new5.cinecloud.site"
+BR_ADS = re.compile(r"profitableratecpm|llvpn\.com|ay267\.com|googletagmanager|google-analytics|cloudflareinsights")
+
+
+def _buttons(c: str) -> list[dict]:
+    c = re.sub(r'<div class="[a-z0-9]+" aria-hidden="true">.*?</div>', "", c, flags=re.S)   # hidden decoys
+    out = []
+    for m in re.finditer(r"<a\b([^>]*)>(.*?)</a>", c, re.S):
+        a = dict(re.findall(r'([\w-]+)="([^"]*)"', m.group(1)))
+        if a.get("tabindex") == "-1":
+            continue
+        out.append({"href": unescape(a.get("href", "")), "text": re.sub(r"<[^>]+>|\s+", " ", m.group(2)).strip()[:60]})
+    return out
+
+
+async def _br_page(page, fid: str) -> tuple[str, list]:
+    """Open one file page, pass Turnstile, return (title, buttons)."""
+    import asyncio
+    await page.goto(f"{BR_HOST}/f/{fid}", timeout=90000)
+
+    async def ev(js):
+        try:
+            return await page.evaluate(js)
+        except Exception:  # noqa: BLE001  (the page navigates while Turnstile finishes)
+            return None
+
+    async def click_ts():
+        for fr in page.frames:
+            if "challenges.cloudflare.com" in fr.url:
+                try:
+                    box = await (await fr.frame_element()).bounding_box()
+                    if box:
+                        await page.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
+                except Exception:  # noqa: BLE001
+                    pass
+    c = ""
+    for i in range(60):
+        c = await ev("() => { const e=document.getElementById('download-buttons-container'); return e ? e.innerHTML : ''; }") or ""
+        if c.strip() and "cf-ts-box" not in c:
+            break
+        # an episode page with only the V2 player shows no buttons at all, just the vidzer iframe
+        if await ev("() => !!document.querySelector('iframe#cfPlayer[src]')"):
+            return (await ev("() => document.title")) or "", [{"href": "", "text": "PLAYER V2"}]
+        await asyncio.sleep(1)
+        if i in (5, 12, 25, 45):
+            await click_ts()
+    return (await ev("() => document.title")) or "", _buttons(c)
+
+
+def _br_class(btns: list) -> dict:
+    out = {"host": "unknown", "url": None}
+    for b in btns:
+        m = R2_RE.match(b["href"])
+        if m:
+            return parse_file_page(m.group(0))
+    texts = " ".join(b["text"] for b in btns)
+    if "V2" in texts and "Instant Download" not in texts:
+        out["host"] = "v2"
+    elif "Instant Download" in texts or "Cloud [Resumable]" in texts:
+        out["host"] = "gd" if "V2" not in texts else "v2"
+    return out
+
+
+def cmd_bresolve(args):
+    """Files behind the wall, newest first, through one browser tab until the deadline or the limit."""
+    import asyncio
+    conn = db()
+    rows = conn.execute(
+        "SELECT f.fid, f.quality FROM files f LEFT JOIN titles t ON t.slug=f.slug "
+        "WHERE f.host='wall' OR (f.res_err IS NOT NULL AND f.res_err LIKE '%403%') "
+        "ORDER BY COALESCE(t.published, '') DESC, f.quality DESC LIMIT ?", (args.limit,)).fetchall()
+    if not rows:
+        print("[browser] nothing behind the wall", flush=True)
+        return 0
+    by = deadline_of("RESOLVE")
+    print(f"[browser] {len(rows)} files behind the wall", flush=True)
+    try:
+        from patchright.async_api import async_playwright
+    except ImportError:
+        say("[browser] patchright is not installed; skipped")
+        return 0
+    stat: dict = {}
+
+    async def run():
+        n = 0
+        async with async_playwright() as p:
+            ctx = await p.chromium.launch_persistent_context(os.environ.get("LIB_BROWSER_PROFILE", "/tmp/lib-prof"), channel="chromium",
+                                                             headless=False, no_viewport=True)
+
+            async def block(route):
+                await route.abort()
+            await ctx.route(BR_ADS, block)
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            for r in rows:
+                if time.time() > by - 120:
+                    say(f"[browser] time budget reached at {n}/{len(rows)}")
+                    break
+                fid = r["fid"]
+                out = {"host": "unknown", "url": None, "bytes": None, "start_ms": None, "err": None}
+                if r["quality"] == 480:
+                    # no 480p file carries the R2 copy (0 of the 13,152 R2 files in the Library, 2026-10-14): not opened
+                    write_retry(conn, "UPDATE files SET host='v2', url=NULL, resolved_at=?, res_err=NULL WHERE fid=?", (int(time.time()), fid))
+                    stat["v2"] = stat.get("v2", 0) + 1
+                    continue
+                try:
+                    _, btns = await _br_page(page, fid)
+                    out.update(_br_class(btns))
+                    if not btns:
+                        out["host"], out["err"] = "wall", "no buttons"
+                    if out["host"] == "r2":
+                        req = urllib.request.Request(out["url"], headers={"User-Agent": UA, "Range": "bytes=0-1023"})
+                        with urllib.request.urlopen(req, timeout=30) as resp:
+                            m = re.search(r"/(\d+)$", resp.headers.get("Content-Range") or "")
+                            out["bytes"] = int(m.group(1)) if m else int(resp.headers.get("Content-Length") or 0)
+                        out["start_ms"] = voice_start(out["url"])
+                except Exception as e:  # noqa: BLE001
+                    out["host"], out["err"] = "wall", str(e)[:200]
+                stat[out["host"]] = stat.get(out["host"], 0) + 1
+                write_retry(conn, "UPDATE files SET host=?, url=?, bytes=?, start_ms=?, resolved_at=?, res_err=? WHERE fid=?",
+                            (out["host"], out["url"], out["bytes"], out["start_ms"], int(time.time()), out["err"], fid))
+                n += 1
+                if n % 10 == 0:
+                    conn.commit()
+                    print(f"[browser] {n}/{len(rows)} {json.dumps(stat, sort_keys=True)}", flush=True)
+            await ctx.close()
+        conn.commit()
+        return n
+    n = asyncio.run(run())
+    print(f"[browser] done {n} {json.dumps(stat, sort_keys=True)}", flush=True)
+    return n
 
 
 def cmd_resolve(args):
@@ -1038,6 +1196,9 @@ def cmd_cycle(args):
         cmd_push(args)
         if n < args.round:
             break
+    if os.environ.get("LIB_BROWSER") == "1" and time.time() < by - 300:
+        cmd_bresolve(argparse.Namespace(limit=100000))
+        cmd_push(args)
 
 
 def cmd_stats(args):
@@ -1093,6 +1254,9 @@ def main():
                    ("--round", {"type": int, "default": 1500})):
         y.add_argument(a_, **kw)
     y.set_defaults(fn=cmd_cycle, resolve=False, limit=100000)
+    b = sub.add_parser("bresolve")
+    b.add_argument("--limit", type=int, default=100000)
+    b.set_defaults(fn=cmd_bresolve)
     s = sub.add_parser("stats")
     s.set_defaults(fn=cmd_stats)
     args = ap.parse_args()
