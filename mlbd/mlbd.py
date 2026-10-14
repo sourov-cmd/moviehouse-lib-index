@@ -256,22 +256,35 @@ async def do_index(s, conn, shards: bool, listing: int) -> None:
         man = json.loads(mtxt)
         al = "abcdefghijklmnopqrstuvwxyz0123456789"
         keys = [a + b for a in al for b in al]
-        # 12 at a time with a pause: 48 at once drew 1,284 "slow down" (429) answers on the first GitHub run (2026-10-14)
-        for i in range(0, len(keys), 12):
-            res = await s.get_many([f"/assets/search-suggest/v{man['v']}/{k}.json" for k in keys[i:i + 12]], 1.0)
-            for st, txt, _ in res:
-                if st != 200:
-                    continue
-                try:
-                    rows = json.loads(txt)
-                except Exception:  # noqa: BLE001
-                    continue
-                for r in rows:
-                    if len(r) < 5 or r[3] not in KINDS:
+        # 12 at a time with a pause: 48 at once drew 1,284 "slow down" (429) answers on the first GitHub run (2026-10-14);
+        # a shard still answered 429 (432 of 1,296 on the second run) is asked once more at the end, 6 at a time
+        later: list = []
+
+        async def take(todo, step, pause, retry):
+            for i in range(0, len(todo), step):
+                part = todo[i:i + step]
+                res = await s.get_many([f"/assets/search-suggest/v{man['v']}/{k}.json" for k in part], pause)
+                for k, (st, txt, _) in zip(part, res):
+                    if st == 429 and retry:
+                        later.append(k)
+                    if st != 200:
                         continue
-                    yr = int(r[4]) if str(r[4]).isdigit() else None
-                    upsert_item(conn, f"/{r[3]}/{r[1]}", kind=r[3], title=r[0], year=yr, poster=r[2])
-            conn.commit()
+                    try:
+                        rows = json.loads(txt)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for r in rows:
+                        if len(r) < 5 or r[3] not in KINDS:
+                            continue
+                        yr = int(r[4]) if str(r[4]).isdigit() else None
+                        upsert_item(conn, f"/{r[3]}/{r[1]}", kind=r[3], title=r[0], year=yr, poster=r[2])
+                conn.commit()
+        await take(keys, 12, 1.0, True)
+        if later:
+            await asyncio.sleep(30)
+            n429 = len(later)
+            await take(list(later), 6, 2.0, False)
+            print(f"[index] {n429} shards asked again after a pause", flush=True)
     # 3. the newest-first listing: its cards link through a per-request token, so a card is known by its poster;
     #    an unknown poster is a post this index has not seen (read its page to learn where it lives)
     unknown = []
