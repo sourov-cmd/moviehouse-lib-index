@@ -206,6 +206,17 @@ def parse_title(h: str) -> dict:
         if k in seen or (f["quality"] == 480 and (f["season"], f["ep_from"], f["ep_to"]) in has720):
             continue
         seen.add(k); uniq.append(f)
+    # an episode keeps ONE file (2026-10-14: the first GitHub run read ~10 files per post, series being most of them):
+    # 720p plain first (plays on every phone), then 720p HEVC, 1080p, 480p. Films keep every picture size.
+    rank = lambda f: ({720: 0, 1080: 2, 480: 3}.get(f["quality"], 4) + (1 if f["hevc"] and f["quality"] == 720 else 0))  # noqa: E731
+    best = {}
+    for f in uniq:
+        if f["season"] is None:
+            continue
+        k = (f["season"], f["ep_from"], f["ep_to"])
+        if k not in best or rank(f) < rank(best[k]):
+            best[k] = f
+    uniq = [f for f in uniq if f["season"] is None or best[(f["season"], f["ep_from"], f["ep_to"])] is f]
     t["files"], t["episodes"] = uniq, sorted(eps)
     return t
 
@@ -245,8 +256,9 @@ async def do_index(s, conn, shards: bool, listing: int) -> None:
         man = json.loads(mtxt)
         al = "abcdefghijklmnopqrstuvwxyz0123456789"
         keys = [a + b for a in al for b in al]
-        for i in range(0, len(keys), 48):
-            res = await s.get_many([f"/assets/search-suggest/v{man['v']}/{k}.json" for k in keys[i:i + 48]])
+        # 12 at a time with a pause: 48 at once drew 1,284 "slow down" (429) answers on the first GitHub run (2026-10-14)
+        for i in range(0, len(keys), 12):
+            res = await s.get_many([f"/assets/search-suggest/v{man['v']}/{k}.json" for k in keys[i:i + 12]], 1.0)
             for st, txt, _ in res:
                 if st != 200:
                     continue
