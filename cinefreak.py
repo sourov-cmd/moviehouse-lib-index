@@ -838,7 +838,7 @@ def _br_class(btns: list) -> dict:
 
 
 def cmd_bresolve(args):
-    """Files behind the wall, newest first, through one browser tab until the deadline or the limit."""
+    """Files behind the wall, newest first, through LIB_BROWSER_TABS browser tabs until the deadline or the limit."""
     import asyncio
     conn = db()
     rows = conn.execute(
@@ -866,42 +866,59 @@ def cmd_bresolve(args):
             async def block(route):
                 await route.abort()
             await ctx.route(BR_ADS, block)
-            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-            for r in rows:
-                if time.time() > by - 120:
-                    say(f"[browser] time budget reached at {n}/{len(rows)}")
-                    break
-                fid = r["fid"]
-                out = {"host": "unknown", "url": None, "bytes": None, "start_ms": None, "err": None}
-                if r["quality"] == 480:
-                    # no 480p file carries the R2 copy (0 of the 13,152 R2 files in the Library, 2026-10-14): not opened
-                    write_retry(conn, "UPDATE files SET host='v2', url=NULL, resolved_at=?, res_err=NULL WHERE fid=?", (int(time.time()), fid))
-                    stat["v2"] = stat.get("v2", 0) + 1
-                    continue
-                why = ""
-                try:
-                    title, btns = await _br_page(page, fid)
-                    out.update(_br_class(btns))
-                    if not btns:
-                        why = "moment" if "moment" in title.lower() else ("notfound" if "not found" in title.lower() or not title else "nobuttons")
-                        out["host"], out["err"] = "wall", f"no buttons ({why})"
-                    if out["host"] == "r2":
-                        req = urllib.request.Request(out["url"], headers={"User-Agent": UA, "Range": "bytes=0-1023"})
-                        with urllib.request.urlopen(req, timeout=30) as resp:
-                            m = re.search(r"/(\d+)$", resp.headers.get("Content-Range") or "")
-                            out["bytes"] = int(m.group(1)) if m else int(resp.headers.get("Content-Length") or 0)
-                        out["start_ms"] = voice_start(out["url"])
-                except Exception as e:  # noqa: BLE001
-                    why = "exc-" + type(e).__name__
-                    out["host"], out["err"] = "wall", str(e)[:200]
-                key = out["host"] + (f":{why}" if out["host"] == "wall" else "")
-                stat[key] = stat.get(key, 0) + 1
-                write_retry(conn, "UPDATE files SET host=?, url=?, bytes=?, start_ms=?, resolved_at=?, res_err=? WHERE fid=?",
-                            (out["host"], out["url"], out["bytes"], out["start_ms"], int(time.time()), out["err"], fid))
-                n += 1
-                if n % 10 == 0:
-                    conn.commit()
-                    print(f"[browser] {n}/{len(rows)} {json.dumps(stat, sort_keys=True)}", flush=True)
+            # LIB_BROWSER_TABS tabs share one profile (one Turnstile clearance), each taking the next file
+            tabs = max(1, int(os.environ.get("LIB_BROWSER_TABS", "3")))
+            pages = [ctx.pages[0] if ctx.pages else await ctx.new_page()]
+            while len(pages) < tabs:
+                pages.append(await ctx.new_page())
+            todo = list(rows)
+
+            def probe(url):
+                req = urllib.request.Request(url, headers={"User-Agent": UA, "Range": "bytes=0-1023"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    m = re.search(r"/(\d+)$", resp.headers.get("Content-Range") or "")
+                    size = int(m.group(1)) if m else int(resp.headers.get("Content-Length") or 0)
+                return size, voice_start(url)
+
+            async def worker(page, k):
+                nonlocal n
+                await asyncio.sleep(k * 4)   # stagger the first loads
+                while todo:
+                    if time.time() > by - 120:
+                        return
+                    r = todo.pop(0)
+                    fid = r["fid"]
+                    out = {"host": "unknown", "url": None, "bytes": None, "start_ms": None, "err": None}
+                    if r["quality"] == 480:
+                        # no 480p file carries the R2 copy (0 of the 13,152 R2 files in the Library, 2026-10-14): not opened
+                        write_retry(conn, "UPDATE files SET host='v2', url=NULL, resolved_at=?, res_err=NULL WHERE fid=?", (int(time.time()), fid))
+                        stat["v2"] = stat.get("v2", 0) + 1
+                        n += 1
+                        continue
+                    why = ""
+                    try:
+                        title, btns = await _br_page(page, fid)
+                        out.update(_br_class(btns))
+                        if not btns:
+                            why = "moment" if "moment" in title.lower() else ("notfound" if "not found" in title.lower() or not title else "nobuttons")
+                            out["host"], out["err"] = "wall", f"no buttons ({why})"
+                        if out["host"] == "r2":
+                            out["bytes"], out["start_ms"] = await asyncio.to_thread(probe, out["url"])
+                    except Exception as e:  # noqa: BLE001
+                        why = "exc-" + type(e).__name__
+                        out["host"], out["err"] = "wall", str(e)[:200]
+                    key = out["host"] + (f":{why}" if out["host"] == "wall" else "")
+                    stat[key] = stat.get(key, 0) + 1
+                    write_retry(conn, "UPDATE files SET host=?, url=?, bytes=?, start_ms=?, resolved_at=?, res_err=? WHERE fid=?",
+                                (out["host"], out["url"], out["bytes"], out["start_ms"], int(time.time()), out["err"], fid))
+                    n += 1
+                    if n % 10 == 0:
+                        conn.commit()
+                        print(f"[browser] {n}/{len(rows)} {json.dumps(stat, sort_keys=True)}", flush=True)
+
+            await asyncio.gather(*(worker(pg, k) for k, pg in enumerate(pages)))
+            if todo:
+                say(f"[browser] time budget reached at {n}/{len(rows)}")
             await ctx.close()
         conn.commit()
         return n
@@ -1224,9 +1241,16 @@ def cmd_cycle(args):
         cmd_push(args)
         if n < args.round:
             break
-    if os.environ.get("LIB_BROWSER") == "1" and time.time() < by - 300:
-        cmd_bresolve(argparse.Namespace(limit=100000))
-        cmd_push(args)
+    # 2026-10-14: files behind the Turnstile wall go through the browser (LIB_BROWSER_TABS tabs), in rounds of LIB_BROWSER_ROUND files,
+    # each round pushed at once (a run that is stopped keeps what it found)
+    if os.environ.get("LIB_BROWSER") == "1":
+        rnd = int(os.environ.get("LIB_BROWSER_ROUND", "300"))
+        while time.time() < by - 300:
+            n = cmd_bresolve(argparse.Namespace(limit=rnd))
+            args.limit = 100000
+            cmd_push(args)
+            if n < rnd:
+                break
 
 
 def cmd_stats(args):
