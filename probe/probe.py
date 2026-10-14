@@ -41,8 +41,26 @@ async def main():
         print("turnstile clicks:", clicked)
         await page.screenshot(path="/tmp/shot.png")
         print("challenge passed:", "moment" not in (await page.title()).lower(), "after", round(time.time() - t, 1), "s")
+        page2 = await ctx.new_page()
+        hosts_seen = set()
         async def get(u):
-            return await page.evaluate("async u => { const r = await fetch(u, {credentials:'include'}); return [r.status, await r.text()] }", u)
+            if u.startswith(base):
+                try:
+                    return await page.evaluate("async u => { const r = await fetch(u, {credentials:'include'}); return [r.status, await r.text()] }", u)
+                except Exception:
+                    pass
+            hosts_seen.add(u.split("/")[2].split(".", 1)[-1])
+            r = await page2.goto(u, timeout=60000)
+            for i in range(30):
+                t = (await page2.title()).lower()
+                if "moment" not in t: break
+                await asyncio.sleep(2)
+                if i in (5, 12):
+                    for fr in page2.frames:
+                        if "challenges.cloudflare.com" in fr.url:
+                            box = await (await fr.frame_element()).bounding_box()
+                            if box: await page2.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
+            return [r.status if r else 0, await page2.content()]
         st, m = await get(base + "/search-suggest/manifest"); print("manifest", st)
         if st != 200:
             await ctx.close(); print("SUMMARY blocked"); return
@@ -71,6 +89,6 @@ async def main():
                 ok_fsl += code == 206
             else:
                 print(f"title {tried}: page {st}, files {len(files)}, no FSL found")
-        print("SUMMARY fsl_206", ok_fsl, "of", tried)
+        print("SUMMARY fsl_206", ok_fsl, "of", tried, "other hosts:", sorted(hosts_seen))
         await ctx.close()
 asyncio.run(main())
