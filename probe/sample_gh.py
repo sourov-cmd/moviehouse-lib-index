@@ -5,6 +5,8 @@ from mlbd_dec import dec
 from patchright.async_api import async_playwright
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 200
 FILE_CAP = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+SHARDS = int(sys.argv[3]) if len(sys.argv) > 3 else 1296
+PACE = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
 
 def current_host():
     h = urllib.request.urlopen(urllib.request.Request("https://movielinkbd.com/", headers={"User-Agent": "Mozilla/5.0"}), timeout=30).read().decode("utf8", "ignore")
@@ -47,16 +49,21 @@ async def main():
                             except Exception: pass
             return False
         await page.goto(base + "/", timeout=90000); print("challenge passed:", await solve(page))
-        nreq = 0
+        nreq = 0; stats = collections.Counter(); errs = collections.Counter()
         async def get(u):
             nonlocal nreq; nreq += 1
             for attempt in range(3):
                 try:
                     r = await page.evaluate("async u => { const r = await fetch(u, {credentials:'include'}); return [r.status, await r.text()] }", u)
-                    if r[0] == 403 and "moment" in r[1][:3000].lower():
+                    stats[r[0]] += 1
+                    if r[0] in (403, 503) and ("moment" in r[1][:3000].lower() or "challenge" in r[1][:3000].lower()):
                         await page.goto(base + "/", timeout=90000); await solve(page); continue
+                    if r[0] == 429:
+                        await asyncio.sleep(20 * (attempt + 1)); continue
+                    await asyncio.sleep(PACE)
                     return r
-                except Exception:
+                except Exception as e:
+                    errs[type(e).__name__ + ":" + str(e)[:60]] += 1
                     await asyncio.sleep(3)
             return [0, ""]
         st, m = await get(base + "/search-suggest/manifest"); man = json.loads(m)
@@ -65,7 +72,7 @@ async def main():
         print("manifest:", {k: man[k] for k in man if k not in ("discovery", "catalog_probe")}, "discovery:", str(man.get("discovery"))[:200])
         shards = [a + b for a in string.ascii_lowercase + string.digits for b in string.ascii_lowercase + string.digits]
         t0 = time.time()
-        for k in shards:
+        for k in shards[:SHARDS]:
             st, x = await get(f"{base}/assets/search-suggest/v{man['v']}/{k}.json")
             if st == 200:
                 try:
@@ -81,7 +88,10 @@ async def main():
             kind = "series" if r[3] == "series" else "movie"
             st, h = await get(f"{base}/{kind}/{r[1]}")
             pt = per_type[kind]; pt["titles"] += 1
-            if st != 200: pt["page_err"] += 1; continue
+            if st != 200:
+                pt["page_err"] += 1; pt[f"page_st_{st}"] += 1
+                if pt["page_err"] <= 3: print("page err sample", st, len(h), re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", h))[:160])
+                continue
             bt = buttons(h); pt["files_total"] += len(bt)
             if not bt: pt["no_buttons"] += 1; continue
             pt["ep_labelled"] += sum(1 for _, l in bt if EP.search(l))
@@ -108,6 +118,7 @@ async def main():
             if (i + 1) % 25 == 0: print(f"  {i+1}/{len(sample)} titles, {nreq} requests, {round(time.time()-t0)} s")
         for k, v in per_type.items(): print("RESULT", k, dict(v))
         print("hosts on file pages without FSL:", dict(no_fsl_hosts.most_common(12)))
+        print("status counts", dict(stats), "fetch errors", dict(errs.most_common(5)))
         print("total requests", nreq, "time", round(time.time() - t0), "s")
         await ctx.close()
 asyncio.run(main())
