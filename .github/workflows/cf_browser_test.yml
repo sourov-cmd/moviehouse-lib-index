@@ -14,7 +14,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     env:
       GH_TOKEN: ${{ github.token }}
       LIB_DB: ${{ github.workspace }}/state/index.sqlite
@@ -38,11 +38,23 @@ jobs:
           rm state/index.sqlite.enc
       - name: Before
         run: python3 cinefreak.py stats
-      - name: Crawl (incl. the one-time re-read of cut file codes), resolve, browser pass (60 files)
+      - name: Crawl (incl. the one-time re-read of cut file codes), resolve, browser pass
         run: |
-          now=$(date +%s); export LIB_CRAWL_BY=$((now+20*60)) LIB_RESOLVE_BY=$((now+50*60))
+          now=$(date +%s); export LIB_CRAWL_BY=$((now+18*60)) LIB_RESOLVE_BY=$((now+60*60))
           python3 cinefreak.py crawl
-          python3 cinefreak.py resolve --limit 3000
-          xvfb-run -a python3 cinefreak.py bresolve --limit 60 2>&1 | grep -v -E "ERROR|inotify|dbus" || true
+          python3 cinefreak.py resolve --limit 20000
+          xvfb-run -a python3 cinefreak.py bresolve --limit 400 2>&1 | grep --line-buffered -v -E "ERROR|inotify|dbus" || true
+      - name: What the browser pass found (counts)
+        run: |
+          python3 - <<'PY'
+          import sqlite3, os, time
+          c = sqlite3.connect(os.environ["LIB_DB"])
+          since = int(time.time()) - 50 * 60
+          for r in c.execute("SELECT host, quality, COUNT(*), SUM(start_ms IS NOT NULL), SUM(bytes > 0) FROM files WHERE resolved_at > ? AND host != 'wall' GROUP BY 1, 2", (since,)):
+              print("resolved", r)
+          for r in c.execute("SELECT res_err, COUNT(*) FROM files WHERE host='wall' AND res_err IS NOT NULL GROUP BY 1"):
+              print("wall", (r[0] or "")[:40], r[1])
+          print("titles that gained a playable r2 file:", c.execute("SELECT COUNT(DISTINCT slug) FROM files WHERE host='r2' AND resolved_at > ?", (since,)).fetchone()[0])
+          PY
       - name: After
         run: python3 cinefreak.py stats
