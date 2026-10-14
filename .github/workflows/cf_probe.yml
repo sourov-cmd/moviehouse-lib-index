@@ -12,7 +12,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install --quiet patchright && python -m patchright install --with-deps chromium
-      - run: cd probe && xvfb-run -a python cf_probe2.py
+      - run: cd probe && xvfb-run -a python cf_probe3.py
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: out, path: /tmp/out, retention-days: 1 }
