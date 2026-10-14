@@ -245,16 +245,32 @@ def dup_groups(titles: list[dict]) -> dict[int, int]:
     every season any of them has (per season, the main card's own files first). A post counts as the same show when
     the title, the language set and the TMDB id agree (the year when no TMDB id is known), so two shows that only
     share a name stay apart."""
-    groups: dict[tuple, list[dict]] = {}
+    # A second source (movielinkbd, 2026-10-14) posts no TMDB id: its copy of a show joins the one TMDB-known show of
+    # that title and language set when its year falls within that show's years (±1); otherwise it is matched by year.
+    pre: dict[tuple, list[dict]] = {}
     for t in titles:
         if not t.get("playable") or t.get("adult"):
             continue
         k = key(t["title"])
         if not k:
             continue
-        typ = int(t["type"])
-        same = ("tmdb", int(t["tmdb_id"])) if typ == 2 and t.get("tmdb_id") else ("year", t.get("year"))
-        groups.setdefault((typ, k, same, frozenset(langs(t.get("language")))), []).append(t)
+        pre.setdefault((int(t["type"]), k, frozenset(langs(t.get("language")))), []).append(t)
+    groups: dict[tuple, list[dict]] = {}
+    for (typ, k, ls), ts in pre.items():
+        span: dict[int, list[int]] = {}   # TMDB id -> the years its posts carry
+        if typ == 2:
+            for t in ts:
+                if t.get("tmdb_id") and t.get("year"):
+                    span.setdefault(int(t["tmdb_id"]), []).append(int(t["year"]))
+        only = next(iter(span.items())) if len(span) == 1 else None
+        for t in ts:
+            if typ == 2 and t.get("tmdb_id"):
+                same = ("tmdb", int(t["tmdb_id"]))
+            elif typ == 2 and only and t.get("year") and min(only[1]) - 1 <= int(t["year"]) <= max(only[1]) + 1:
+                same = ("tmdb", only[0])
+            else:
+                same = ("year", t.get("year"))
+            groups.setdefault((typ, k, same, ls), []).append(t)
     out: dict[int, int] = {}
     for (typ, *_), g in groups.items():
         if len(g) < 2:

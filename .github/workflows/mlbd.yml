@@ -1,0 +1,98 @@
+name: Library sync (movielinkbd)
+
+# The Library's second source (Viktor, 2026-10-14): see mlbd/mlbd.py. One real browser passes the site's challenge,
+# reads what changed, resolves the new files to their direct links and pushes the difference to the Library worker.
+# Public repo = free Actions minutes. State: encrypted asset mlbd.sqlite.enc of the `state` release. Logs: counts only.
+#
+# A push to the viktor/mlbd branch is a TEST: a fresh index, a small sample, nothing pushed, nothing saved.
+# Production (2026-10-14, owner's approval): a run every hour reads what is new; while the first full pass is not
+# finished each run also works through the backlog. Repository variable LIB_MLBD_CHAIN=1 makes every run start the
+# next one (GitHub's hourly schedule alone fires only every 3-8 hours). D1 writes stay under LIB_DAILY_ROWS (40k/day).
+on:
+  schedule:
+    - cron: "23 * * * *"
+  push:
+    branches: [viktor/mlbd]
+    paths: ["mlbd/**", ".github/workflows/mlbd.yml"]
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Time budget in minutes (a backfill: up to 330)"
+        default: "50"
+      listing:
+        description: "Pages of the newest-first listing to walk (a backfill: 520)"
+        default: "3"
+
+concurrency:
+  group: lib-mlbd
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    permissions:
+      contents: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MLBD_DB: ${{ github.workspace }}/state/mlbd.sqlite
+      LIB_QUIET: "1"
+      LIB_BASE: ${{ secrets.LIB_INGEST_BASE }}
+      LIB_KEY: ${{ secrets.LIB_INGEST_KEY }}
+      STATE_KEY: ${{ secrets.LIB_STATE_KEY }}
+      TEST: ${{ github.event_name == 'push' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          pip install --quiet patchright
+          python -m patchright install --with-deps chromium >/dev/null
+          command -v xvfb-run >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq xvfb)
+      - name: Fetch the state
+        run: |
+          mkdir -p state
+          if [ "$TEST" = "1" ]; then echo "test: fresh state"; exit 0; fi
+          if gh release download state --repo "$GITHUB_REPOSITORY" --pattern mlbd.sqlite.enc --dir state 2>/dev/null; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:STATE_KEY -in state/mlbd.sqlite.enc -out "$MLBD_DB"
+            rm state/mlbd.sqlite.enc
+          else
+            echo "no saved state yet: the first run builds the index"
+          fi
+      - name: Index, crawl, resolve, push
+        run: |
+          M="${{ inputs.minutes }}"; L="${{ inputs.listing }}"; M="${M:-50}"; L="${L:-3}"
+          now=$(date +%s)
+          export MLBD_CRAWL_BY=$((now + M*60*2/5)) MLBD_RESOLVE_BY=$((now + M*60))
+          if [ "$TEST" = "1" ]; then
+            export MLBD_CRAWL_BY=$((now + 15*60)) MLBD_RESOLVE_BY=$((now + 40*60))
+            xvfb-run -a python3 mlbd/mlbd.py cycle --listing 2 --limit 200 --round 250 2>&1 | grep -v -E "ERROR|inotify|dbus" || true
+          else
+            export MLBD_PUSH=1
+            xvfb-run -a python3 mlbd/mlbd.py cycle --listing "$L" 2>&1 | grep -v -E "ERROR|inotify|dbus" || true
+          fi
+          python3 mlbd/mlbd.py stats
+      - name: Save the state
+        if: always() && env.TEST != '1'
+        run: |
+          [ -s "$MLBD_DB" ] || exit 0
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:STATE_KEY -in "$MLBD_DB" -out state/mlbd.sqlite.enc
+          gh release view state --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create state --repo "$GITHUB_REPOSITORY" --title "state" --notes "Encrypted crawler state, replaced by every run." --latest=false
+          gh release upload state state/mlbd.sqlite.enc --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Next run in an hour (the schedule alone is not reliable)
+        if: ${{ !cancelled() && env.TEST != '1' && vars.LIB_MLBD_CHAIN == '1' }}
+        run: |
+          # Never sooner than 55 minutes after this run began, and only when no other run of this workflow waits.
+          q='[.workflow_runs[] | select(.id != ${{ github.run_id }}) | select(.status=="queued" or .status=="in_progress" or .status=="pending")] | length'
+          others=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/mlbd.yml/runs?per_page=20" --jq "$q")
+          if [ "${others:-0}" -gt 0 ]; then echo "another run is waiting; nothing to do"; exit 0; fi
+          start=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/${{ github.run_id }}" --jq .run_started_at)
+          wait=$(( $(date -d "$start" +%s) + 55*60 - $(date +%s) ))
+          [ "$wait" -gt 0 ] && sleep "$wait"
+          others=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/mlbd.yml/runs?per_page=20" --jq "$q")
+          if [ "${others:-0}" -gt 0 ]; then echo "the schedule started one meanwhile; nothing to do"; exit 0; fi
+          gh workflow run mlbd.yml --repo "$GITHUB_REPOSITORY" --ref main
+          echo "next run started"

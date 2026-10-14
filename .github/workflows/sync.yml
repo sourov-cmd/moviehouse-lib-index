@@ -50,6 +50,13 @@ jobs:
       LIB_CONCURRENCY: "6"
       LIB_RESOLVE_CONCURRENCY: ${{ inputs.resolve_concurrency || '8' }}
       LIB_ROUND: ${{ inputs.round || '1500' }}
+      # 2026-10-14: the file host shows Turnstile to plain requests; new files go through a real browser (3 tabs,
+      # rounds of 300, each round pushed). D1 writes on the Library account: this source 45k/day, movielinkbd 40k/day,
+      # 15k left for the shelf flags and the app (free plan: 100k/day).
+      LIB_BROWSER: "1"
+      LIB_BROWSER_ROUND: "300"
+      LIB_BROWSER_TABS: "3"
+      LIB_DAILY_ROWS: "45000"
       LIB_QUIET: "1"
       # A second egress lane (owner's Bright Data proxy, 2026-10-11): the source allows ~2 requests/s per IP,
       # so two lanes resolve about twice as fast. Empty secret = direct line only, exactly as before.
@@ -63,8 +70,10 @@ jobs:
         with:
           python-version: "3.12"
       - run: |
-          pip install --quiet beautifulsoup4 lxml numpy
+          pip install --quiet beautifulsoup4 lxml numpy patchright
+          python -m patchright install --with-deps chromium >/dev/null
           command -v ffmpeg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
+          command -v xvfb-run >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq xvfb)
 
       - name: Time budget
         run: |
@@ -88,7 +97,10 @@ jobs:
           fi
 
       - name: Crawl, resolve, push
-        run: python3 cinefreak.py cycle --round "$LIB_ROUND"
+        run: |
+          set -o pipefail
+          # the browser's own noise (dbus, inotify) is dropped; a crawler failure still fails the step
+          xvfb-run -a python3 cinefreak.py cycle --round "$LIB_ROUND" 2>&1 | { grep --line-buffered -v -E "ERROR:|inotify|dbus" || true; }
 
       - name: Save the state
         if: always()

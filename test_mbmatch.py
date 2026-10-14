@@ -106,6 +106,17 @@ class Dups(unittest.TestCase):
         ]
         self.assertEqual(dup_groups(t), {})
 
+    def test_a_second_source_without_tmdb_joins_the_known_show(self):
+        t = [
+            {"num": 30, "type": 2, "title": "Bigg Boss", "year": 2024, "language": "Hindi", "tmdb_id": 1, "playable": 1, "files_n": 60, "first_seen": 1, "adult": 0, "seasons": [18]},
+            {"num": 31, "type": 2, "title": "Bigg Boss", "year": 2025, "language": "Hindi", "playable": 1, "files_n": 45, "first_seen": 2, "adult": 0, "seasons": [19]},
+            {"num": 32, "type": 2, "title": "Bigg Boss", "year": 2006, "language": "Hindi", "playable": 1, "files_n": 9, "first_seen": 3, "adult": 0, "seasons": [1]},
+            {"num": 33, "type": 1, "title": "Nilar Baba", "year": 2025, "language": "Bangla", "playable": 1, "files_n": 2, "first_seen": 4, "adult": 0},
+            {"num": 34, "type": 1, "title": "Nilar Baba", "year": 2025, "language": "Bengali", "playable": 1, "files_n": 1, "first_seen": 1, "adult": 0},
+        ]
+        # 31 (no TMDB id, year inside the show's span) joins the show; 32 (19 years apart) stays its own card
+        self.assertEqual(dup_groups(t), {31: 30, 34: 33})
+
     def test_key(self):
         self.assertEqual(key("Wednesday S2"), "wednesday")
         self.assertEqual(key("K.G.F: Chapter 2"), key("KGF: Chapter 2"))
