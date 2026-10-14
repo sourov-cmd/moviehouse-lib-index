@@ -1137,14 +1137,15 @@ def cmd_push(args):
     if budget <= 0:
         say(f"[push] today's D1 write budget is used ({spent} est. rows); next push after 00:00 UTC")
         return 0
-    # A title goes out once every file of it has been resolved (one write per title instead of two), and only
+    # A title goes out once every file of it has been resolved (one write per title instead of two; a file the browser
+    # has not opened yet counts as unresolved, 2026-10-14), and only
     # when it can be played, or when the worker already holds it (so a title that lost its files is updated).
     # Playable and newest first, so the titles users can watch land first when the day's budget runs out.
     rows = conn.execute(
         "SELECT t.slug, (SELECT COUNT(*) FROM files f WHERE f.slug=t.slug) nf, (SELECT COUNT(*) FROM episodes e WHERE e.slug=t.slug) ne, "
         "EXISTS(SELECT 1 FROM files f WHERE f.slug=t.slug AND f.host IN ('r2','gu')) pl FROM titles t "
         "WHERE t.post_id IS NOT NULL AND t.title IS NOT NULL "
-        "AND NOT EXISTS(SELECT 1 FROM files f WHERE f.slug=t.slug AND f.resolved_at IS NULL) "
+        "AND NOT EXISTS(SELECT 1 FROM files f WHERE f.slug=t.slug AND (f.resolved_at IS NULL OR (f.host='wall' AND f.res_err IS NULL))) "
         "AND (t.pushed_hash IS NULL OR t.pushed_hash != t.hash || ':' || COALESCE((SELECT MAX(resolved_at) FROM files f WHERE f.slug=t.slug), 0)) "
         "AND (t.pushed_hash IS NOT NULL OR EXISTS(SELECT 1 FROM files f WHERE f.slug=t.slug AND f.host IN ('r2','gu'))) "
         "ORDER BY pl DESC, COALESCE(t.published,'') DESC LIMIT ?", (args.limit,)).fetchall()
