@@ -24,7 +24,8 @@ are: a work MovieBox already plays (same title, kind, year, language) leaves the
     python3 mlbd.py stats
 
 Num = 2,100,000,000 + the site's content id (the first source uses 2,000,000,000 + its post id: no overlap).
-Adult posts (/download18plus/) are never read. Logs print counts only when LIB_QUIET=1 (public repository).
+Adult posts (/download18plus/) are read too since 2026-10-14 (owner: "18+ গুলোও দিবেন, midnight এ রাখবেন"): they go
+out with the badge "Adult", so the Library keeps them off every shelf and family search (the app shows them under Midnight). Logs print counts only when LIB_QUIET=1 (public repository).
 """
 from __future__ import annotations
 
@@ -49,7 +50,7 @@ QUIET = os.environ.get("LIB_QUIET") == "1"
 DAILY_ROWS = int(os.environ.get("LIB_DAILY_ROWS", "40000"))   # this source's share of the D1 free plan (100k rows/day)
 ROW_FACTOR = float(os.environ.get("LIB_ROW_FACTOR", "4.0"))
 BASE_NUM = 2_100_000_000
-KINDS = ("movie", "series", "drama", "anime")                  # never download18plus
+KINDS = ("movie", "series", "drama", "anime", "download18plus")  # 18+ posts carry badges "Adult"
 UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
 PACE = float(os.environ.get("MLBD_PACE", "0.3"))               # seconds between page requests (one tab)
 BATCH = int(os.environ.get("MLBD_BATCH", "4"))                 # pages fetched together
@@ -102,7 +103,7 @@ def meta_set(conn, k, v):
 
 # ---------------------------------------------------------------- parsing
 
-PATH_RE = re.compile(r"^/(movie|series|drama|anime)/([a-z0-9][a-z0-9-]*)$")
+PATH_RE = re.compile(r"^/(movie|series|drama|anime|download18plus)/([a-z0-9][a-z0-9-]*)$")
 
 
 def _attrs(tag: str) -> dict:
@@ -292,7 +293,7 @@ async def do_index(s, conn, shards: bool, listing: int) -> None:
         st, x, _ = await s.get("/new" if pg == 1 else f"/new/page/{pg}", PACE)
         if st != 200:
             break
-        cards = re.findall(r'<a data-mlbd-click-ad="movie-card" href="(/(?:movie|series|drama|anime)/[^"]+)">\s*<img[^>]*data-src="([^"]+)"', x)
+        cards = re.findall(r'<a data-mlbd-click-ad="movie-card" href="(/(?:movie|series|drama|anime|download18plus)/[^"]+)">\s*<img[^>]*data-src="([^"]+)"', x)
         new_here = [(href, poster) for href, poster in cards if not conn.execute("SELECT 1 FROM items WHERE card_poster=?", (poster,)).fetchone()]
         unknown += new_here
         if pg > 2 and not new_here and listing < 50:   # a delta walk stops at the first page it fully knows
@@ -354,6 +355,9 @@ async def do_crawl(s, conn, limit: int) -> int:
     rows = conn.execute(
         "SELECT path FROM items WHERE fetched_at IS NULL OR (lastmod IS NOT NULL AND (fetched_mod IS NULL OR lastmod > fetched_mod)) "
         "OR (err IS NOT NULL AND fetched_at < ?) ORDER BY COALESCE(lastmod, '') DESC LIMIT ?", (int(time.time()) - 86400, limit)).fetchall()
+    only = os.environ.get("MLBD_ONLY")   # a test may read just one kind of post (e.g. /download18plus/)
+    if only:
+        rows = conn.execute("SELECT path FROM items WHERE fetched_at IS NULL AND path LIKE ? LIMIT ?", (only + "%", limit)).fetchall()
     paths = [r["path"] for r in rows]
     by = deadline("CRAWL")
     print(f"[crawl] {len(paths)} pages to read", flush=True)
@@ -469,7 +473,7 @@ def payload(conn, path: str) -> dict:
         "num": BASE_NUM + int(t["cid"]), "slug": "mlbd-" + path.strip("/").replace("/", "-"), "type": kind, "title": t["title"], "aka": t["aka"],
         "year": t["year"], "poster": poster, "overview": t["overview"], "genres": t["genres"], "language": t["language"],
         "country": None, "rating": t["rating"], "releaseDate": None, "runtime": None, "tmdbId": None, "imdbId": None, "status": t["status"],
-        "cats": ",".join(x for x in (t["kind"].title() if t["kind"] else None, t["language"]) if x), "ott": None, "badges": None,
+        "cats": ",".join(x for x in (t["kind"].title() if t["kind"] else None, t["language"]) if x), "ott": None, "badges": "Adult" if path.startswith("/download18plus/") else None,
         "published": None, "modified": None, "hash": f"{t['hash']}:{mx}", "episodes": eps, "files": files,
     }
 
@@ -542,6 +546,9 @@ def stats(conn) -> None:
     print("files", q("SELECT COUNT(*) FROM files"), "resolved", q("SELECT COUNT(*) FROM files WHERE resolved_at IS NOT NULL"),
           "direct", q("SELECT COUNT(*) FROM files WHERE host='r2'"),
           "titles playable", q("SELECT COUNT(DISTINCT path) FROM files WHERE host='r2'"), "pushed", q("SELECT COUNT(*) FROM titles WHERE pushed_hash IS NOT NULL"))
+    print("posts by kind", {r[0]: r[1] for r in conn.execute("SELECT kind, COUNT(*) FROM items GROUP BY kind")},
+          "titles by kind", {r[0]: r[1] for r in conn.execute("SELECT substr(path, 2, instr(substr(path, 2), '/') - 1), COUNT(*) FROM titles GROUP BY 1")},
+          "playable by kind", {r[0]: r[1] for r in conn.execute("SELECT substr(path, 2, instr(substr(path, 2), '/') - 1), COUNT(DISTINCT path) FROM files WHERE host='r2' GROUP BY 1")})
     for r in conn.execute("SELECT COALESCE(substr(res_err,1,12),'ok') e, COUNT(*) n FROM files WHERE resolved_at IS NOT NULL GROUP BY e ORDER BY n DESC LIMIT 8"):
         print("  ", r["e"], r["n"])
 

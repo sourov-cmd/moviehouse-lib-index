@@ -62,7 +62,8 @@ jobs:
           export MLBD_CRAWL_BY=$((now + M*60*2/5)) MLBD_RESOLVE_BY=$((now + M*60))
           if [ "$TEST" = "1" ]; then
             export MLBD_CRAWL_BY=$((now + 15*60)) MLBD_RESOLVE_BY=$((now + 40*60))
-            xvfb-run -a python3 mlbd/mlbd.py cycle --listing 2 --limit 200 --round 250 2>&1 | grep -v -E "ERROR|inotify|dbus" || true
+            export MLBD_ONLY=/download18plus/   # 2026-10-14 test: the 18+ posts only
+            xvfb-run -a python3 mlbd/mlbd.py cycle --listing 2 --limit 80 --round 250 2>&1 | grep -v -E "ERROR|inotify|dbus" || true
           else
             export MLBD_PUSH=1
             xvfb-run -a python3 mlbd/mlbd.py cycle --listing "$L" 2>&1 | grep -v -E "ERROR|inotify|dbus" || true
