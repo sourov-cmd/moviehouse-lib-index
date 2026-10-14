@@ -783,9 +783,12 @@ def _buttons(c: str) -> list[dict]:
     return out
 
 
-async def _br_page(page, fid: str) -> tuple[str, list]:
-    """Open one file page, pass Turnstile, return (title, buttons)."""
+async def _br_page(page, fid: str, wait: int = 75) -> tuple[str, list]:
+    """Open one file page, pass Turnstile, return (title, buttons). The first page shows Cloudflare's full-page check,
+    then the page's own Turnstile box guards the buttons; each is clicked once it has drawn (the click pattern proven on
+    GitHub's runners, 2026-10-14: 24 s for the first page, 10 s for every page after it)."""
     import asyncio
+    t0 = time.time()
     await page.goto(f"{BR_HOST}/f/{fid}", timeout=90000)
 
     async def ev(js):
@@ -799,21 +802,24 @@ async def _br_page(page, fid: str) -> tuple[str, list]:
             if "challenges.cloudflare.com" in fr.url:
                 try:
                     box = await (await fr.frame_element()).bounding_box()
-                    if box:
+                    if box and box["width"] > 0:
                         await page.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
                 except Exception:  # noqa: BLE001
                     pass
-    c = ""
-    for i in range(60):
+    c, clicks, marks = "", 0, (6, 20, 40, 60)
+    while time.time() - t0 < wait:
         c = await ev("() => { const e=document.getElementById('download-buttons-container'); return e ? e.innerHTML : ''; }") or ""
         if c.strip() and "cf-ts-box" not in c:
             break
         # an episode page with only the V2 player shows no buttons at all, just the vidzer iframe
         if await ev("() => !!document.querySelector('iframe#cfPlayer[src]')"):
             return (await ev("() => document.title")) or "", [{"href": "", "text": "PLAYER V2"}]
-        await asyncio.sleep(1)
-        if i in (5, 12, 25, 45):
+        if clicks < len(marks) and time.time() - t0 > marks[clicks] and any("challenges.cloudflare.com" in f.url for f in page.frames):
+            clicks += 1
             await click_ts()
+        await asyncio.sleep(2)
+    if "cf-ts-box" in c:
+        c = ""
     return (await ev("() => document.title")) or "", _buttons(c)
 
 
@@ -872,11 +878,13 @@ def cmd_bresolve(args):
                     write_retry(conn, "UPDATE files SET host='v2', url=NULL, resolved_at=?, res_err=NULL WHERE fid=?", (int(time.time()), fid))
                     stat["v2"] = stat.get("v2", 0) + 1
                     continue
+                why = ""
                 try:
-                    _, btns = await _br_page(page, fid)
+                    title, btns = await _br_page(page, fid)
                     out.update(_br_class(btns))
                     if not btns:
-                        out["host"], out["err"] = "wall", "no buttons"
+                        why = "moment" if "moment" in title.lower() else ("notfound" if "not found" in title.lower() or not title else "nobuttons")
+                        out["host"], out["err"] = "wall", f"no buttons ({why})"
                     if out["host"] == "r2":
                         req = urllib.request.Request(out["url"], headers={"User-Agent": UA, "Range": "bytes=0-1023"})
                         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -884,8 +892,10 @@ def cmd_bresolve(args):
                             out["bytes"] = int(m.group(1)) if m else int(resp.headers.get("Content-Length") or 0)
                         out["start_ms"] = voice_start(out["url"])
                 except Exception as e:  # noqa: BLE001
+                    why = "exc-" + type(e).__name__
                     out["host"], out["err"] = "wall", str(e)[:200]
-                stat[out["host"]] = stat.get(out["host"], 0) + 1
+                key = out["host"] + (f":{why}" if out["host"] == "wall" else "")
+                stat[key] = stat.get(key, 0) + 1
                 write_retry(conn, "UPDATE files SET host=?, url=?, bytes=?, start_ms=?, resolved_at=?, res_err=? WHERE fid=?",
                             (out["host"], out["url"], out["bytes"], out["start_ms"], int(time.time()), out["err"], fid))
                 n += 1
@@ -904,12 +914,30 @@ def cmd_resolve(args):
     conn = db()
     rows = conn.execute(
         "SELECT f.fid, f.watch FROM files f LEFT JOIN titles t ON t.slug=f.slug "
-        "WHERE f.resolved_at IS NULL OR (f.host IN ('unknown') AND f.resolved_at < ?) OR (f.res_err IS NOT NULL AND f.resolved_at < ?) "
+        "WHERE (length(f.fid) = 8 OR length(f.fid) >= 20) AND (f.resolved_at IS NULL OR (f.host IN ('unknown') AND f.resolved_at < ?) OR (f.res_err IS NOT NULL AND f.resolved_at < ?)) "
         "ORDER BY COALESCE(t.published, '') DESC, f.watch DESC, f.rowid DESC LIMIT ?",
         (int(time.time()) - 86400, int(time.time()) - 6 * 3600, args.limit)).fetchall()
     by = deadline_of("RESOLVE")
     print(f"[resolve] {len(rows)} files", flush=True)
     n, pending = 0, []
+    # 2026-10-14: the file host shows Turnstile to every plain request. Five files are tried first; when all five
+    # hit the wall, the rest go straight to the browser pass instead of costing one request each.
+    if len(rows) > 5:
+        probe = [resolve_one(r["fid"], r["watch"]) for r in rows[:5]]
+        if all(o["host"] == "wall" for _, o in probe):
+            now = int(time.time())
+            for i in range(30):
+                try:
+                    conn.executemany("UPDATE files SET host='wall', url=NULL, resolved_at=?, res_err=NULL WHERE fid=?", [(now, r["fid"]) for r in rows])
+                    conn.commit()
+                    break
+                except sqlite3.OperationalError as e:
+                    if "locked" not in str(e) or i == 29:
+                        raise
+                    conn.rollback()
+                    time.sleep(1 + i * 0.5)
+            print(f"[resolve] the wall is up: {len(rows)} files wait for the browser pass", flush=True)
+            return len(rows)
 
     def flush():
         # one short transaction per batch: the crawl may hold the file most of the time
