@@ -136,7 +136,7 @@ def _buttons(seg: str) -> list[dict]:
             url = dec(a["data-dl"], a.get("data-ds", ""), int(a.get("data-dr") or 0))
         except Exception:  # noqa: BLE001
             continue
-        if not url.startswith("/file/"):
+        if not re.match(r"/file(?:18plus)?/", url):   # 18+ posts link /file18plus/ (measured 2026-10-14)
             continue
         out.append({"label": re.sub(r"^Download\s*", "", label).strip("[] ").strip(), "aurl": url, "pos": m.start()})
     return out
@@ -424,6 +424,9 @@ async def do_resolve(s, conn, limit: int) -> int:
         "SELECT f.fid, f.aurl FROM files f JOIN items i ON i.path=f.path WHERE f.aurl IS NOT NULL AND "
         "(f.resolved_at IS NULL OR (f.res_err IS NOT NULL AND f.res_err NOT LIKE 'archive%' AND f.resolved_at < ?)) "
         "ORDER BY COALESCE(i.lastmod,'') DESC, f.quality=720 DESC, f.quality DESC LIMIT ?", (int(time.time()) - 86400, limit)).fetchall()
+    only = os.environ.get("MLBD_ONLY")   # a test resolves just the kind it read
+    if only:
+        rows = conn.execute("SELECT fid, aurl FROM files WHERE aurl IS NOT NULL AND resolved_at IS NULL AND path LIKE ? LIMIT ?", (only + "%", limit)).fetchall()
     by = deadline("RESOLVE")
     print(f"[resolve] {len(rows)} files", flush=True)
     n, stat = 0, {}
