@@ -297,16 +297,39 @@ def _hidden(el) -> bool:
     return el.find_parent(attrs={"aria-hidden": "true"}) is not None
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):  # noqa: ANN002, ANN003
+        return None
+
+
+# one no-redirect opener per egress lane: the direct line first, then the proxy lane(s), so one blocked IP does not stop it
+_GEN_OPENERS = [urllib.request.build_opener(urllib.request.ProxyHandler({"http": u, "https": u}) if u else urllib.request.ProxyHandler({}), _NoRedirect)
+                for u in _LANES]
+
+
 def _unwrap(href: str | None) -> str | None:
-    """18+ posts live on a sister site whose buttons wrap the file link: generate.php?id=<base64 of the /f/ URL>."""
-    m = re.search(r"generate\.php\?id=([A-Za-z0-9+/=_-]+)", href or "")
-    if not m:
+    """18+ posts live on a sister site whose buttons go through generate.php?id=<base64>. 2026-10-15: the base64 holds a
+    DECOY code (".../f/<16 chars>newgo32", 620 files, every one "not found" in the browser); the real file is where
+    generate.php redirects (a full 62-char code, the same from every IP, measured from two networks). So the redirect
+    is followed, one request per 18+ file. When it does not redirect, the page fails and is read again in 6 hours:
+    a decoy code is never stored."""
+    if not href or not re.search(r"generate\.php\?id=", href):
         return href
-    try:
-        raw = m.group(1)
-        return base64.b64decode(raw + "=" * (-len(raw) % 4), altchars=b"-_" if ("-" in raw or "_" in raw) else None).decode("utf-8", "replace")
-    except Exception:  # noqa: BLE001
-        return href
+    url = urllib.parse.urljoin(SITE + "/", href)
+    last = None
+    for i in range(max(3, len(_GEN_OPENERS))):
+        try:
+            _GEN_OPENERS[i % len(_GEN_OPENERS)].open(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=30)
+            last = "no redirect"
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("Location") if e.code in (301, 302, 303, 307, 308) else None
+            if loc and _FID.search(loc) and not _FID.search(loc).group(2).endswith("newgo32"):
+                return loc
+            last = f"http {e.code}"
+        except Exception as e:  # noqa: BLE001
+            last = str(e)[:80]
+        time.sleep(1.5 * (i + 1))
+    raise RuntimeError(f"18+ link did not lead to a file ({last})")
 
 
 def _fid(href: str | None) -> str | None:
@@ -766,6 +789,16 @@ def cmd_crawl(args):
         slugs = list(dict.fromkeys(slugs + args.slugs.split(",")))
     # pages seen on a card walk but never read (a run that ran out of time) are always picked up
     known = set(slugs)
+    # ONCE (genfix, 2026-10-15): 620 18+ files on 219 pages were read from the decoy inside generate.php (codes ending
+    # "newgo32", "not found" in the browser). They are dropped and those pages are read again (fetched_at NULL is
+    # picked up just below, and again by every run until the page has been read), now through the redirect.
+    if not conn.execute("SELECT 1 FROM meta WHERE k='genfix'").fetchone():
+        bad = [r["slug"] for r in conn.execute("SELECT DISTINCT slug FROM files WHERE fid LIKE '%newgo32'")]
+        conn.execute("DELETE FROM files WHERE fid LIKE '%newgo32'")
+        conn.executemany("UPDATE titles SET fetched_at=NULL WHERE slug=?", [(x,) for x in bad])
+        conn.execute("INSERT INTO meta(k,v) VALUES('genfix',?)", (str(int(time.time())),))
+        conn.commit()
+        print(f"[genfix] {len(bad)} 18+ pages are read again for their real file codes", flush=True)
     for r in conn.execute("SELECT slug FROM titles WHERE fetched_at IS NULL OR (err IS NOT NULL AND fetched_at < ?) ORDER BY rowid DESC", (int(time.time()) - 6 * 3600,)):
         if r["slug"] not in known:
             slugs.append(r["slug"]); known.add(r["slug"])
@@ -965,12 +998,14 @@ def _br_class(btns: list) -> dict:
 
 
 def cmd_bresolve(args):
-    """Files behind the wall, newest first, through LIB_BROWSER_TABS browser tabs until the deadline or the limit."""
+    """Files behind the wall (and, since 2026-10-15, files a plain request read as 'unknown': the page's Turnstile box hid
+    the buttons), newest first, through LIB_BROWSER_TABS browser tabs until the deadline or the limit."""
     import asyncio
     conn = db()
     rows = conn.execute(
         "SELECT f.fid, f.quality FROM files f LEFT JOIN titles t ON t.slug=f.slug "
         "WHERE f.host='wall' OR (f.res_err IS NOT NULL AND f.res_err LIKE '%403%') "
+        "OR (f.host='unknown' AND f.res_err IS NULL AND (length(f.fid) = 8 OR length(f.fid) >= 20)) "
         "ORDER BY COALESCE(t.published, '') DESC, f.quality DESC LIMIT ?", (args.limit,)).fetchall()
     if not rows:
         print("[browser] nothing behind the wall", flush=True)
@@ -1034,6 +1069,9 @@ def cmd_bresolve(args):
                     except Exception as e:  # noqa: BLE001
                         why = "exc-" + type(e).__name__
                         out["host"], out["err"] = "wall", str(e)[:200]
+                    if out["host"] == "unknown" and not out["err"]:
+                        # the browser saw the buttons but none it knows: marked, so this pass does not take it again every run
+                        out["err"] = "browser: no known button"
                     key = out["host"] + (f":{why}" if out["host"] == "wall" else "")
                     stat[key] = stat.get(key, 0) + 1
                     write_retry(conn, "UPDATE files SET host=?, url=?, bytes=?, start_ms=?, resolved_at=?, res_err=? WHERE fid=?",
@@ -1068,7 +1106,9 @@ def cmd_resolve(args):
     # hit the wall, the rest go straight to the browser pass instead of costing one request each.
     if len(rows) > 5:
         probe = [resolve_one(r["fid"], r["watch"]) for r in rows[:5]]
-        if all(o["host"] == "wall" for _, o in probe):
+        # 2026-10-15: through a proxy lane the page loads, but its own Turnstile box hides the buttons, so the file reads as
+        # 'unknown' (2,930 such files, 0 resolved by a plain request since 2026-10-14 15:00): that is the wall too
+        if all(o["host"] in ("wall", "unknown") and not o.get("url") for _, o in probe):
             now = int(time.time())
             for i in range(30):
                 try:
