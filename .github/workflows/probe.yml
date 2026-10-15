@@ -27,7 +27,7 @@ jobs:
           LIB_DB: /tmp/probe.sqlite
         run: |
           cat > /tmp/p.py <<'PY'
-          import asyncio, os, re, sys, time, urllib.request
+          import asyncio, os, re, sys, time, urllib.request, urllib.error
           sys.path.insert(0, os.getcwd())
           import cinefreak as cf
           async def main():
@@ -51,10 +51,28 @@ jobs:
                           print(f"{fid[:10]}… {int(time.time()-t0)}s title={title[:50]!r} buttons={[b['text'] for b in btns][:5]} host={out['host']} urlhost={host} size={size}", flush=True)
                           for b in btns[:6]:
                               print(f"    href {b['text'][:24]!r} -> {b['href'][:110]!r}", flush=True)
-                          await asyncio.sleep(10)
-                          html2 = await page.evaluate("() => { const e=document.getElementById('download-buttons-container'); return e ? e.innerHTML : ''; }") or ""
-                          print(f"    after+10s: {[(b['text'][:20], b['href'][:90]) for b in cf._buttons(html2)][:6]}", flush=True)
-                          print(f"    raw: {re.sub(r'\\s+', ' ', html2)[:900]!r}", flush=True)
+                          class NoRedir(urllib.request.HTTPRedirectHandler):
+                              def redirect_request(self, *a, **k): return None
+                          for b in btns:
+                              if not b["href"].startswith("/f/") or not any(k in b["text"] for k in ("FSL", "Instant Download", "Resumable")):
+                                  continue
+                              u = cf.BR_HOST + b["href"]
+                              try:
+                                  r = await page.request.get(u, max_redirects=0, timeout=30000)
+                                  body = (await r.text())[:300] if r.status < 300 else ""
+                                  print(f"    browser-ctx {b['text'][:22]!r}: {r.status} loc={r.headers.get('location','')[:140]!r} body={re.sub(chr(10), ' ', body)[:200]!r}", flush=True)
+                              except Exception as e:
+                                  print(f"    browser-ctx {b['text'][:22]!r}: ERR {type(e).__name__} {str(e)[:120]}", flush=True)
+                              try:
+                                  op = urllib.request.build_opener(NoRedir)
+                                  rq = urllib.request.Request(u, headers={"User-Agent": cf.UA})
+                                  try:
+                                      rr = op.open(rq, timeout=30); st, loc = rr.status, rr.headers.get("Location", "")
+                                  except urllib.error.HTTPError as he:
+                                      st, loc = he.code, he.headers.get("Location", "")
+                                  print(f"    plain {b['text'][:22]!r}: {st} loc={loc[:140]!r}", flush=True)
+                              except Exception as e:
+                                  print(f"    plain {b['text'][:22]!r}: ERR {type(e).__name__} {str(e)[:120]}", flush=True)
                       except Exception as e:
                           print(f"{fid[:10]}… ERROR {type(e).__name__}: {str(e)[:150]}", flush=True)
                   await ctx.close()
