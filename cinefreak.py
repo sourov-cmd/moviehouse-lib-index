@@ -20,6 +20,7 @@ Environment: LIB_DB (default ./lib-index.sqlite), LIB_BASE, LIB_KEY, LIB_CONCURR
 from __future__ import annotations
 
 import argparse
+import base64
 import itertools
 import hashlib
 import json
@@ -287,13 +288,35 @@ def max_page(html: str) -> int:
 _FID = re.compile(r"cinecloud\.site/([fxwd])/([A-Za-z0-9_-]+)")
 
 
+def _hidden(el) -> bool:
+    """A decoy: the element or a parent is aria-hidden, or the link is out of the tab order (the site's scraper traps)."""
+    if el is None:
+        return False
+    if el.get("tabindex") == "-1" or el.get("aria-hidden") == "true":
+        return True
+    return el.find_parent(attrs={"aria-hidden": "true"}) is not None
+
+
+def _unwrap(href: str | None) -> str | None:
+    """18+ posts live on a sister site whose buttons wrap the file link: generate.php?id=<base64 of the /f/ URL>."""
+    m = re.search(r"generate\.php\?id=([A-Za-z0-9+/=_-]+)", href or "")
+    if not m:
+        return href
+    try:
+        raw = m.group(1)
+        return base64.b64decode(raw + "=" * (-len(raw) % 4), altchars=b"-_" if ("-" in raw or "_" in raw) else None).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return href
+
+
 def _fid(href: str | None) -> str | None:
     m = _FID.search(href or "")
     return m.group(2) if m else None
 
 
 def _size_mb(text: str) -> float | None:
-    m = re.search(r"\[?\s*([\d.]+)\s*(GB|MB)\s*\]?", text or "", re.I)
+    # "[2..2 GB]" / "[1.8. GB]" are typos on the page: a malformed number is no size (it used to crash the title)
+    m = re.search(r"\[?\s*(\d+(?:\.\d+)?)\.?\s*(GB|MB)\s*\]?", re.sub(r"(\d)\.\.(\d)", r"\1.\2", text or ""), re.I)
     if not m:
         return None
     n = float(m.group(1))
@@ -459,15 +482,91 @@ def parse_title(html: str, slug: str) -> dict:
                         "size_mb": _size_mb(small.get_text() if small else hq), "label": hq.strip(), "lang": lang,
                         "watch": 1 if fid in watch_fids else 0,
                     })
+    elif soup.select_one(".episode-grid .ep-card"):
+        # THE OLDER SERIES LAYOUT (2026-10-15): no #cfSeries, one .ep-card per episode, the files in two pop-up boxes
+        # ("Download Resolution" / "Watch Resolution"). It was read as a film with no files, so ~180 series never
+        # reached the app. The download box's links are the files; a watch link with the same quality marks it watch.
+        for card in soup.select(".episode-grid .ep-card"):
+            if _hidden(card):
+                continue
+            tt = card.select_one(".ep-title")
+            sm = re.search(r"Season\s*(\d+)", tt.get_text(" ", strip=True) if tt else "", re.I)
+            season = int(sm.group(1)) if sm else 1
+            badge = card.select_one(".episode-badge")
+            # only "Episode 3" / "Episode 1-8" / "Episode: 1-8" is an episode card; an empty badge, "Batch/MKV",
+            # "Season 1 Complete" or a pasted title ("Goodbye Earth (2024) Season 1") is a whole-season pack, skipped
+            # like the #cfSeries layout skips its packs (measured on the 1,017 pages: 311 empty, 40 batch, ~90 titles)
+            em = re.search(r"\bEp(?:isode)?s?\s*[:.#]?\s*(\d{1,4})(?:\s*(?:[-–~]|to)\s*(?:Ep(?:isode)?\s*)?(\d{1,4}))?(?!\d)",
+                           badge.get_text(" ", strip=True) if badge else "", re.I)
+            if not em or re.search(r"isn.t available", badge.get_text(" ", strip=True), re.I):
+                continue
+            ep_from = int(em.group(1))
+            ep_to = int(em.group(2)) if em.group(2) and int(em.group(2)) >= ep_from else ep_from
+            if ep_from <= 0 or ep_to - ep_from > 60:
+                continue
+            for ep in range(ep_from, ep_to + 1):
+                out["episodes"].append({"season": season, "ep": ep, "name": None, "aired": None, "runtime": None, "lang": None})
+            boxes = {b.get("id", ""): b for b in card.select(".quality-box")}
+            dl = next((b for k, b in boxes.items() if k.startswith("dl")), None)
+            wb = next((b for k, b in boxes.items() if k.startswith("watch")), None)
+            watch_q = {_quality(a.get_text(" ", strip=True)) for a in (wb.select("a") if wb else []) if not _hidden(a)}
+            for a in (dl or wb).select("a") if (dl or wb) else []:
+                if _hidden(a):
+                    continue
+                fid = _fid(a.get("href"))
+                if not fid:
+                    continue
+                hq = a.get_text(" ", strip=True)
+                out["files"].append({
+                    "fid": fid, "season": season, "ep_from": ep_from, "ep_to": ep_to, "quality": _quality(hq),
+                    "hevc": 1 if re.search(r"hevc|x265|10\s*bit", hq, re.I) else 0, "size_mb": _size_mb(hq), "label": hq,
+                    "lang": None, "watch": 1 if (dl is None or _quality(hq) in watch_q) else 0,
+                })
+        # a page of whole-season packs only (no episode card) stays as it was read before: no files, not a series to re-check
+        if out["episodes"]:
+            out["type"] = "tv"
     else:
-        for h4 in soup.select(".download-links-div h4.movie-title"):
+        seen_ep: set = set()
+        for h4 in soup.select(".download-links-div h4"):
+            # a decoy block (aria-hidden, its links tabindex=-1) sits in front of the real ones: never a file of ours
+            if _hidden(h4):
+                continue
             label = h4.get_text(" ", strip=True)
             box = h4.find_next_sibling("div")
             if not box:
                 continue
-            dl = box.select_one("a.dlbtn-download")
+            # THE EPISODE-BUTTON SERIES LAYOUT (2026-10-15): "<h4>Monvojon (2024) Season 1 [Bengali] HD 720p</h4>" and a
+            # row of "Episode 1" ... "Episode 15" buttons, one file each. Read as a film it became Episode 1 alone.
+            eps = []
+            for a in box.select("a") if "downloads-btns-div" in (box.get("class") or []) else []:
+                m = re.fullmatch(r"Ep(?:isode)?s?\s*[:.#]?\s*(\d{1,4})(?:\s*[-–~]\s*(\d{1,4}))?", a.get_text(" ", strip=True), re.I)
+                if m and not _hidden(a):
+                    eps.append((a, int(m.group(1)), int(m.group(2) or m.group(1))))
+            if eps:
+                out["type"] = "tv"
+                sm = re.search(r"Season\s*(\d+)", label, re.I)
+                season = int(sm.group(1)) if sm else 1
+                for a, ep_from, ep_to in eps:
+                    fid = _fid(_unwrap(a.get("href")))
+                    # the same file behind two buttons (Cute Programmer "Episode 10" and "Episode 11") is one file: the
+                    # first button keeps it; for a file the host serves directly, refine() reads the true episode from its name
+                    if not fid or fid in seen_ep or ep_from <= 0 or ep_to < ep_from or ep_to - ep_from > 60:
+                        continue
+                    seen_ep.add(fid)
+                    for ep in range(ep_from, ep_to + 1):
+                        if not any(e["season"] == season and e["ep"] == ep for e in out["episodes"]):
+                            out["episodes"].append({"season": season, "ep": ep, "name": None, "aired": None, "runtime": None, "lang": _lang_tag(label)})
+                    out["files"].append({
+                        "fid": fid, "season": season, "ep_from": ep_from, "ep_to": ep_to, "quality": _quality(label),
+                        "hevc": 1 if re.search(r"hevc|x265|10\s*bit", label, re.I) else 0, "size_mb": None,
+                        "label": f"{label} Episode {ep_from}" + (f"-{ep_to}" if ep_to != ep_from else ""), "lang": _lang_tag(label), "watch": 0,
+                    })
+                continue
+            dl = box.select_one("a.dlbtn-download") or box.select_one(".downloads-btns-div a, a.btn") or (box.select_one("a") if "downloads-btns-div" in (box.get("class") or []) else None)
+            if dl is not None and _hidden(dl):
+                continue
             w = box.select_one("a.dlbtn-watch")
-            fid = _fid(dl.get("href") if dl else None)
+            fid = _fid(_unwrap(dl.get("href")) if dl else None)
             if not fid:
                 continue
             out["files"].append({
@@ -480,13 +579,19 @@ def parse_title(html: str, slug: str) -> dict:
 
 
 def _norm(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
+    # an apostrophe is dropped, never turned into a space: "Charlotte’s Web" (the field, curly) and "Charlotte's Web"
+    # (the file labels, straight) must read as the same name (2026-10-15: they did not, so the labels "named another
+    # film" and every file of such a title was dropped)
+    s = re.sub(r"['’‘`´]", "", s or "")
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode().lower()
     return re.sub(r"[^a-z0-9]+", " ", s).strip()
 
 
 def _named(s: str) -> str | None:
     """'Ferar Opekkhay (2026) [Bengali] HD 720p' -> 'Ferar Opekkhay'; None when there is no '(year)' to cut at."""
-    m = re.search(r"^(.*?)\s*\((\d{4})\)", s or "")
+    # a leading tag ("[18+] Ungol (2024) ...", the 18+ sister site's labels) is not part of the name
+    s = re.sub(r"^\s*(?:\[[^\]]*\]\s*)+", "", s or "")
+    m = re.search(r"^(.*?)\s*\((\d{4})\)", s)
     return m.group(1).strip(" -–|") if m else None
 
 
@@ -511,7 +616,11 @@ def _settle_title(out: dict, name: str, h1t: str) -> None:
     h1_name = _named(h1t)
     if h1_name and _norm(h1_name) != _norm(out["title"]) and votes(h1_name) > votes(out["title"]):
         out["title"] = re.sub(r"\s+", " ", h1_name)
-    if len(labels) >= 2 and votes(out["title"]) == 0 and not (h1_name and votes(h1_name)) and not votes(name or ""):
+    # the H1 naming the labels' film anywhere keeps the files: a dub's post is "Shatamanam Bhavati – Poribar 2024"
+    # with every label "Poribar (2024)" (2026-10-15: 184 such titles had lost all their files)
+    h1n = f" {_norm(h1t)} "
+    in_h1 = any(f" {l} " in h1n for l in labels)
+    if len(labels) >= 2 and votes(out["title"]) == 0 and not (h1_name and votes(h1_name)) and not votes(name or "") and not in_h1:
         out["files"] = [f for f in out["files"] if f.get("season") is not None]
         out["files_dropped"] = "labels name another film"
 
@@ -684,6 +793,24 @@ def cmd_crawl(args):
                 slugs.append(r["slug"]); known.add(r["slug"])
         conn.execute("INSERT INTO meta(k,v) VALUES('fidfix',?)", (str(int(time.time())),))
         conn.commit()
+    # ONCE PER TITLE (layouts, 2026-10-15): the parser now reads the older series layouts (episode cards, episode
+    # buttons), the 18+ sister site's wrapped buttons and the dub posts whose labels carry the dub's name. 1,017 read
+    # pages had no file at all (227 of them 18+) and a page with no file is never read again, so each is queued once,
+    # newest first, until it has been read by this parser: the moment it first ran is kept in meta, and a title read
+    # after it drops out of the query by itself, so a run that runs out of time loses nothing. Titles that have files
+    # are NOT re-read (that would re-resolve and re-write ~10,000 of them for nothing).
+    lv = conn.execute("SELECT v FROM meta WHERE k='layouts'").fetchone()
+    if not lv:
+        conn.execute("INSERT INTO meta(k,v) VALUES('layouts',?)", (str(int(time.time())),))
+        conn.commit()
+        lv = conn.execute("SELECT v FROM meta WHERE k='layouts'").fetchone()
+    nre = 0
+    for r in conn.execute("SELECT slug FROM titles t WHERE fetched_at > 0 AND fetched_at < ? AND NOT EXISTS (SELECT 1 FROM files f WHERE f.slug=t.slug) "
+                          "ORDER BY COALESCE(published, '') DESC", (int(lv["v"]),)):
+        if r["slug"] not in known:
+            slugs.append(r["slug"]); known.add(r["slug"]); nre += 1
+    if nre:
+        print(f"[layouts] {nre} pages with no file are read again by the new parser", flush=True)
     # series still airing are re-read on every delta run (new episodes do not move the card)
     if not args.full:
         for r in conn.execute("SELECT slug FROM titles WHERE type='tv' AND (status IS NULL OR status NOT LIKE '%All Episodes%') AND fetched_at < ?", (int(time.time()) - args.series_recheck_hours * 3600,)):
