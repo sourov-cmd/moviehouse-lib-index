@@ -1,0 +1,33 @@
+# Read-only copy of the crawler state for an audit (Viktor, 2026-10-15). Downloads the `state` release, decrypts it with
+# LIB_STATE_KEY and re-encrypts it with VIKTOR_EXPORT_KEY into a short-lived artifact. Never writes the state back.
+name: State export (audit, read-only)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Copy the state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE_KEY: ${{ secrets.LIB_STATE_KEY }}
+          EXPORT_KEY: ${{ secrets.VIKTOR_EXPORT_KEY }}
+        run: |
+          mkdir -p s out
+          gh release download state --repo "$GITHUB_REPOSITORY" --pattern '*.sqlite.enc' --dir s
+          for f in s/*.sqlite.enc; do
+            b=$(basename "$f" .enc)
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:STATE_KEY -in "$f" -out "s/$b"
+            gzip -9 "s/$b"
+            openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:EXPORT_KEY -in "s/$b.gz" -out "out/$b.gz.enc"
+          done
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: state-export
+          path: out/
+          retention-days: 1
