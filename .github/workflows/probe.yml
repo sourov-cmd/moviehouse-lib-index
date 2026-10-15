@@ -1,0 +1,57 @@
+# One-off check (Viktor, 2026-10-15): open given file codes in the crawler's browser and print what each page offers.
+# Reads nothing from the crawler state and writes nothing anywhere.
+name: Browser probe (read-only)
+on:
+  workflow_dispatch:
+    inputs:
+      fids:
+        description: "Comma-separated file codes"
+        required: true
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          pip install --quiet beautifulsoup4 lxml numpy patchright
+          python -m patchright install --with-deps chromium >/dev/null
+          command -v xvfb-run >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq xvfb)
+      - env:
+          FIDS: ${{ inputs.fids }}
+          LIB_DB: /tmp/probe.sqlite
+        run: |
+          cat > /tmp/p.py <<'PY'
+          import asyncio, os, re, sys, time, urllib.request
+          sys.path.insert(0, os.getcwd())
+          import cinefreak as cf
+          async def main():
+              from patchright.async_api import async_playwright
+              async with async_playwright() as p:
+                  ctx = await p.chromium.launch_persistent_context("/tmp/prof", channel="chromium", headless=False, no_viewport=True)
+                  async def block(route): await route.abort()
+                  await ctx.route(cf.BR_ADS, block)
+                  page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+                  for fid in os.environ["FIDS"].split(","):
+                      t0 = time.time()
+                      try:
+                          title, btns = await cf._br_page(page, fid.strip())
+                          out = cf._br_class(btns)
+                          size = None
+                          if out.get("url"):
+                              req = urllib.request.Request(out["url"], headers={"User-Agent": cf.UA, "Range": "bytes=0-1023"})
+                              with urllib.request.urlopen(req, timeout=30) as r:
+                                  m = re.search(r"/(\d+)$", r.headers.get("Content-Range") or ""); size = (r.status, int(m.group(1)) if m else None)
+                          host = re.sub(r"^https?://([^/]+).*$", r"\1", out.get("url") or "")
+                          print(f"{fid[:10]}… {int(time.time()-t0)}s title={title[:50]!r} buttons={[b['text'] for b in btns][:5]} host={out['host']} urlhost={host} size={size}", flush=True)
+                      except Exception as e:
+                          print(f"{fid[:10]}… ERROR {type(e).__name__}: {str(e)[:150]}", flush=True)
+                  await ctx.close()
+          asyncio.run(main())
+          PY
+          xvfb-run -a python3 /tmp/p.py 2>&1 | { grep --line-buffered -v -E "ERROR:|inotify|dbus" || true; }
