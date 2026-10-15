@@ -1122,7 +1122,7 @@ def cmd_resolve(args):
 # ---------------------------------------------------------------- what goes out (2026-10-12 audit)
 # Fixes applied when a title is pushed, from what the crawler already holds, so no page is read again for them.
 # REFINE_V bumps re-send, once, only the titles whose payload these rules change (see cmd_push).
-REFINE_V = 1
+REFINE_V = 2   # 2 (2026-10-15): Hoichoi/Chorki card badges added to the platforms (~146 titles go out again)
 
 # Files whose picture was checked by eye and is another work (frames at 15:00 compared, 2026-10-12): the page links a
 # file of a different title. Dropped from the payload; the title's other files stay.
@@ -1181,12 +1181,24 @@ def file_episodes(url: str | None) -> tuple[int, int] | None:
     return a, b
 
 
+PLATFORM_BADGES = ("Hoichoi", "Chorki")
+
+
 def refine(t: dict, files: list) -> tuple[str, str | None, list, dict]:
     """(title, aka, files, what changed) for one title about to be pushed."""
     changed: dict = {}
     title, aka = other_name(t["title"], t.get("card_title"))
     if aka:
         changed["name"] = [title, aka]
+    # THE PLATFORM THE SOURCE FILES A POST UNDER (2026-10-15, owner: platform pages "ফুলফিলভাবে ও সঠিকভাবে"). The site
+    # lists its Hoichoi and Chorki posts in categories of their own (the card's badge) and names the platform on the page
+    # only sometimes: 178 titles carried the badge but not the page's platform (140 Hoichoi, so Hoichoi showed 126 of
+    # its ~266). The badge is the source's own filing, so it is added to the page's platforms, never replacing them.
+    have = {x.strip().lower() for x in (t.get("ott") or "").split(",") if x.strip()}
+    extra = [b for b in PLATFORM_BADGES if b in {x.strip() for x in (t.get("badges") or "").split(",")} and b.lower() not in have]
+    if extra:
+        t["ott"] = ",".join([x.strip() for x in (t.get("ott") or "").split(",") if x.strip()] + extra)
+        changed["ott"] = extra
     out = []
     if t["slug"] in WRONG_PAGES:
         changed["wrong_page"] = 1
