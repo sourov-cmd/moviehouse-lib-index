@@ -1,0 +1,137 @@
+# Owner's request (2026-10-15 18:23Z): bring ONE new title into the app now, outside the daily write allowance.
+# Reads the crawler's saved state, reads the title page, resolves its files exactly as the hourly run does (browser,
+# FSL relay -> public R2 copy, size-matched), pushes that one title to the Library. It does NOT save the state back:
+# the hourly run stays the only writer of the state and takes the title in its own turn (same files, same objects).
+# Cost: one title (~30 est. D1 rows). Logs print counts and hosts only, never links.
+name: Push one title now
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: "The title's slug on the source (cinefreak.net/<slug>/)"
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: lib-one
+  cancel-in-progress: false
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LIB_DB: ${{ github.workspace }}/state/index.sqlite
+      LIB_QUIET: "1"
+      LIB_BASE: ${{ secrets.LIB_INGEST_BASE }}
+      LIB_KEY: ${{ secrets.LIB_INGEST_KEY }}
+      STATE_KEY: ${{ secrets.LIB_STATE_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      SLUG: ${{ inputs.slug }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          pip install --quiet beautifulsoup4 lxml numpy patchright
+          python -m patchright install --with-deps chromium >/dev/null
+          command -v ffmpeg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
+          command -v xvfb-run >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq xvfb)
+      - name: Fetch the state (read only)
+        run: |
+          mkdir -p state
+          gh release download state --repo "$GITHUB_REPOSITORY" --pattern index.sqlite.enc --dir state
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:STATE_KEY -in state/index.sqlite.enc -out "$LIB_DB"
+          rm state/index.sqlite.enc
+      - name: Read, resolve, push one title
+        run: |
+          cat > /tmp/one.py <<'PY'
+          import asyncio, json, os, re, sys, time, urllib.request
+          sys.path.insert(0, os.getcwd())
+          import cinefreak as cf
+          slug = os.environ["SLUG"].strip().strip("/")
+          conn = cf.db()
+          # the card's fields (name on the card, badges) exactly as the category walk stores them
+          card = None
+          for u in (cf.SITE + "/", cf.SITE + "/page/2/"):
+              card = next((c for c in cf.parse_cards(cf.fetch(u)) if c["slug"] == slug), None)
+              if card:
+                  break
+          if card:
+              conn.execute("INSERT INTO titles(slug, card_title, poster, time_ago, seen_at, badges) VALUES(?,?,?,?,?,?) "
+                           "ON CONFLICT(slug) DO UPDATE SET card_title=excluded.card_title, poster=COALESCE(titles.poster, excluded.poster), "
+                           "time_ago=excluded.time_ago, seen_at=excluded.seen_at, badges=excluded.badges",
+                           (slug, card["card_title"], card["poster"], card["time_ago"], int(time.time()), ",".join(card["badges"])))
+          print("card:", bool(card), card and card["badges"])
+          _, t, err = cf.fetch_title(slug)
+          if not t:
+              sys.exit(f"title page: {err}")
+          cf.store_title(conn, t)
+          conn.commit()
+          print(f"title: {t['title']} ({t['year']}) post {t['post_id']} type {t['type']} files {len(t['files'])} episodes {len(t['episodes'])}")
+          rows = conn.execute("SELECT fid, quality, size_mb, host, url FROM files WHERE slug=? ORDER BY quality", (slug,)).fetchall()
+
+          def probe(url):
+              req = urllib.request.Request(url, headers={"User-Agent": cf.UA, "Range": "bytes=0-1023"})
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  m = re.search(r"/(\d+)$", resp.headers.get("Content-Range") or "")
+                  size = int(m.group(1)) if m else int(resp.headers.get("Content-Length") or 0)
+              return size, cf.voice_start(url)
+
+          async def run():
+              from patchright.async_api import async_playwright
+              async with async_playwright() as p:
+                  ctx = await p.chromium.launch_persistent_context("/tmp/prof", channel="chromium", headless=False, no_viewport=True)
+                  async def block(route): await route.abort()
+                  await ctx.route(cf.BR_ADS, block)
+                  page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+                  for r in rows:
+                      if r["host"] in ("r2", "r2zip") and r["url"]:
+                          print(f"{r['quality']}p {r['size_mb']} MB: kept r2 copy")
+                          continue
+                      out = None
+                      for attempt in range(3):
+                          o = {"host": "unknown", "url": None, "bytes": None, "start_ms": None, "err": None}
+                          try:
+                              title, btns = await cf._br_page(page, r["fid"])
+                              o.update(cf._br_class(btns))
+                              if btns and o["host"] not in ("r2", "r2zip"):
+                                  fsl = await cf._br_fsl(page, conn, btns)
+                                  if fsl:
+                                      o.update(fsl)
+                              if not btns:
+                                  o["host"], o["err"] = "wall", f"no buttons ({title[:40]})"
+                              print(f"  {r['quality']}p try {attempt + 1}: buttons={[b['text'][:24] for b in btns][:6]} -> {o['host']} {o['err'] or ''}", flush=True)
+                          except Exception as e:  # noqa: BLE001
+                              o["host"], o["err"] = "wall", f"{type(e).__name__}: {str(e)[:120]}"
+                              print(f"  {r['quality']}p try {attempt + 1}: {o['err']}", flush=True)
+                          out = o
+                          if o["host"] in ("r2", "r2zip", "v2", "gd"):
+                              break
+                          await asyncio.sleep(5)
+                      if r["quality"] == 480 and out["host"] != "r2":
+                          # the hourly run's rule for 480p (no R2 copy): recorded as 'v2'
+                          out = {"host": "v2", "url": None, "bytes": None, "start_ms": None, "err": None}
+                      if out["host"] == "r2":
+                          out["bytes"], out["start_ms"] = await asyncio.to_thread(probe, out["url"])
+                      print(f"{r['quality']}p {r['size_mb']} MB: {out['host']} bytes={out['bytes']} start_ms={out['start_ms']} {out['err'] or ''}", flush=True)
+                      cf.write_retry(conn, "UPDATE files SET host=?, url=?, bytes=?, start_ms=?, resolved_at=?, res_err=? WHERE fid=?",
+                                     (out["host"], out["url"], out["bytes"], out["start_ms"], int(time.time()), out["err"], r["fid"]))
+                      conn.commit()
+                  await ctx.close()
+          asyncio.run(run())
+          pl = conn.execute("SELECT COUNT(*) FROM files WHERE slug=? AND host IN ('r2','gu')", (slug,)).fetchone()[0]
+          if not pl:
+              sys.exit("no playable file: nothing pushed")
+          p = cf.title_payload(conn, slug)
+          body = json.dumps({"titles": [{k: v for k, v in p.items() if not k.startswith("_")}]}).encode()
+          req = urllib.request.Request(os.environ["LIB_BASE"].rstrip("/") + "/ingest", data=body, method="POST",
+                                       headers={"content-type": "application/json", "x-lib-key": os.environ["LIB_KEY"], "user-agent": "MovieHouse-LibIndex/2"})
+          with urllib.request.urlopen(req, timeout=120) as resp:
+              res = json.loads(resp.read().decode())
+          print(f"pushed num {p['num']} playable files {pl}: ok={res.get('ok')} written={res.get('written')}")
+          if not res.get("ok"):
+              sys.exit(1)
+          PY
+          xvfb-run -a python3 /tmp/one.py 2>&1 | { grep --line-buffered -v -E "ERROR:|inotify|dbus" || true; }
+          exit ${PIPESTATUS[0]}
