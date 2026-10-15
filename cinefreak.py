@@ -766,6 +766,18 @@ def store_title(conn, t: dict) -> bool:
     conn.executemany("INSERT OR REPLACE INTO episodes(slug, season, ep, name, aired, runtime, lang) VALUES(?,?,?,?,?,?,?)",
                      [(t["slug"], e["season"], e["ep"], e["name"], e["aired"], e["runtime"], e["lang"]) for e in t["episodes"]])
     seen = {f["fid"] for f in t["files"]}
+    # 2026-10-15: a page read again gives its files new codes. A file already resolved to a lasting link (the public R2 copy)
+    # keeps it: the new row of the same file (same season, episodes, quality, size, label) takes the old row's link, when
+    # exactly one old and one new row match. 'gu' is not carried: the gateway asks the host with the file's own code.
+    fkey = lambda f: (f["season"], f["ep_from"], f["ep_to"], f["quality"], f["hevc"], f["size_mb"], f["label"])  # noqa: E731
+    keep: dict = {}
+    for o in conn.execute("SELECT * FROM files WHERE slug=? AND host IN ('r2','r2zip') AND url IS NOT NULL", (t["slug"],)).fetchall():
+        if o["fid"] not in seen:
+            k = fkey(o)
+            keep[k] = None if k in keep else o
+    newk: dict = {}
+    for f in t["files"]:
+        newk[fkey(f)] = newk.get(fkey(f), 0) + 1
     conn.execute("DELETE FROM files WHERE slug=? AND fid NOT IN (%s)" % ",".join("?" * len(seen)) if seen else "DELETE FROM files WHERE slug=?",
                  (t["slug"], *seen) if seen else (t["slug"],))
     for f in t["files"]:
@@ -775,6 +787,10 @@ def store_title(conn, t: dict) -> bool:
             "hevc=excluded.hevc, size_mb=excluded.size_mb, label=excluded.label, lang=excluded.lang, watch=excluded.watch",
             (f["fid"], t["slug"], f["season"], f["ep_from"], f["ep_to"], f["quality"], f["hevc"], f["size_mb"], f["label"], f["lang"], f["watch"]),
         )
+        o = keep.get(fkey(f))
+        if o is not None and newk[fkey(f)] == 1:
+            conn.execute("UPDATE files SET host=?, url=?, sub_url=?, bytes=?, start_ms=?, resolved_at=?, res_err=NULL WHERE fid=? AND (host IS NULL OR host NOT IN ('r2','r2zip'))",
+                         (o["host"], o["url"], o["sub_url"], o["bytes"], o["start_ms"], o["resolved_at"], f["fid"]))
     return old is None or old["hash"] != h
 
 
@@ -971,6 +987,11 @@ async def _br_page(page, fid: str, wait: int = 75) -> tuple[str, list]:
         c = await ev("() => { const e=document.getElementById('download-buttons-container'); return e ? e.innerHTML : ''; }") or ""
         if c.strip() and "cf-ts-box" not in c:
             break
+        # 2026-10-15: a file code read a day ago opens 'Link expired' (5/5 of the pages that showed no buttons, probe run
+        # 38720704966); that page and 'File not Found' never draw buttons, so they are not waited on for 75 s
+        tt = ((await ev("() => document.title")) or "").lower()
+        if "link expired" in tt or "file not found" in tt:
+            return tt, []
         # an episode page with only the V2 player shows no buttons at all, just the vidzer iframe
         if await ev("() => !!document.querySelector('iframe#cfPlayer[src]')"):
             return (await ev("() => document.title")) or "", [{"href": "", "text": "PLAYER V2"}]
@@ -981,6 +1002,72 @@ async def _br_page(page, fid: str, wait: int = 75) -> tuple[str, list]:
     if "cf-ts-box" in c:
         c = ""
     return (await ev("() => document.title")) or "", _buttons(c)
+
+
+# 2026-10-15 ~05:00Z the file page changed: every button is now a relay '/f/<token>' instead of the direct link. The
+# "FAST CLOUD [FSL]" relay answers the browser (its Turnstile clearance) with 307 to a signed, short-lived link
+# '<account>.r2.cloudflarestorage.com/<bucket>/<key>'. The same object is public at 'pub-<id>.r2.dev/<key>' (the link the
+# page used to show; probe run 38722349367: The Dark Knight 720p -> account ae105825..., key = the stored pub-10da0f... key).
+# The public copy is kept (as before); the account -> pub host pair is learned once and kept in meta.
+R2_PUBS = ["eb0dd3d4c4c84462bc3e3f1f8a3f1b61", "8b46bbc58f8c4eb084601251ab7c7f58", "10da0f41c8ea4953ac9ba4a3ec208325",
+           "517c71b46fb044a6ad291c50b48f19a7", "882ef609e0d044d2a950ceb655d0a294", "d7567522e12c40939611b17e558f21d5",
+           "cffc8b5518bd4251a162a6ad7810bd6b", "4bf6c51d258b4008b0f88bff0bb9d208", "40da3f36e12a4ce7bf7be00b6ed7fa6f",
+           "ba5ab25a043c49e5aef446ce41e787c4", "fb1739d1f25f4d65b0a39164a25e1bd0", "ce8a116fe4e349ae967ede26d78b3fda",
+           "e1b76cc556b244f6910482717bcc0f00", "1e48ca6945304766a8827c90f3b3a1b2", "ce92b2c18bfc406e927bcd1a98a6cf92"]
+SIGNED_RE = re.compile(r"^https://([0-9a-f]{32})\.r2\.cloudflarestorage\.com/([^/?]+)/([^?]+)")
+
+
+def _range_size(url: str) -> int | None:
+    """The object's full size from a 1 KB ranged GET; None when it does not answer 206."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Range": "bytes=0-1023"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            if resp.status != 206:
+                return None
+            m = re.search(r"/(\d+)$", resp.headers.get("Content-Range") or "")
+            return int(m.group(1)) if m else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _pub_of_signed(known: str | None, signed: str) -> tuple[str | None, str | None, str]:
+    """Signed R2 link -> (public pub-*.r2.dev link of the same object, its pub id, why not). The public copy must answer
+    206 with the same full size as the signed one. Runs in a worker thread: no database here."""
+    m = SIGNED_RE.match(signed)
+    if not m:
+        return None, None, "relay: not an R2 link"
+    key = m.group(3)
+    want = _range_size(signed)
+    if not want:
+        return None, None, "relay: signed link did not answer"
+    for pub in ([known] if known else []) + [p for p in R2_PUBS if p != known]:
+        url = f"https://pub-{pub}.r2.dev/{key}"
+        if _range_size(url) == want:
+            return url, pub, ""
+    return None, None, f"relay: no public copy ({m.group(1)[:8]})"
+
+
+async def _br_fsl(page, conn, btns: list) -> dict | None:
+    """Follow the page's FSL relay in the page's own browser context; the public R2 copy, or None."""
+    import asyncio
+    for b in btns:
+        if "FSL" in b["text"] and b["href"].startswith("/f/"):
+            r = await page.request.get(BR_HOST + b["href"], max_redirects=0, timeout=30000)
+            loc = r.headers.get("location", "")
+            if r.status not in (301, 302, 303, 307, 308) or not loc:
+                return {"host": "wall", "url": None, "err": f"relay: {r.status}"}
+            m = SIGNED_RE.match(loc)
+            acct = m.group(1) if m else ""
+            k = conn.execute("SELECT v FROM meta WHERE k=?", ("r2pub:" + acct,)).fetchone() if acct else None
+            url, pub, why = await asyncio.to_thread(_pub_of_signed, k[0] if k else None, loc)
+            if not url:
+                return {"host": "wall", "url": None, "err": why}
+            if pub and not (k and k[0] == pub):
+                write_retry(conn, "INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", ("r2pub:" + acct, pub))
+            if re.search(r"\.(zip|rar|7z)(\?|$)", url, re.I):
+                return {"host": "r2zip", "url": url}
+            return {"host": "r2", "url": url}
+    return None
 
 
 def _br_class(btns: list) -> dict:
@@ -1002,11 +1089,22 @@ def cmd_bresolve(args):
     the buttons), newest first, through LIB_BROWSER_TABS browser tabs until the deadline or the limit."""
     import asyncio
     conn = db()
+    # ONCE (fslfix, 2026-10-15): from ~05:00Z the page's buttons became relays and 720p/1080p files were marked 'v2' (no
+    # direct link seen); they are opened again, now through the FSL relay (_br_fsl)
+    if not conn.execute("SELECT 1 FROM meta WHERE k='fslfix'").fetchone():
+        n = conn.execute("UPDATE files SET host='wall', res_err=NULL WHERE host IN ('v2','gd') AND quality != 480 AND resolved_at >= 1792040400").rowcount
+        conn.execute("INSERT INTO meta(k,v) VALUES('fslfix',?)", (str(int(time.time())),))
+        conn.commit()
+        print(f"[fslfix] {n} files marked 'v2' since the page change are opened again", flush=True)
+    # a file that failed in the browser (no buttons, relay error) waits 6 h before it is tried again: before 2026-10-15 the
+    # same ~200 dead pages headed every round at 75 s each and the round never reached older files (the 18+ ones)
     rows = conn.execute(
-        "SELECT f.fid, f.quality FROM files f LEFT JOIN titles t ON t.slug=f.slug "
-        "WHERE f.host='wall' OR (f.res_err IS NOT NULL AND f.res_err LIKE '%403%') "
-        "OR (f.host='unknown' AND f.res_err IS NULL AND (length(f.fid) = 8 OR length(f.fid) >= 20)) "
-        "ORDER BY COALESCE(t.published, '') DESC, f.quality DESC LIMIT ?", (args.limit,)).fetchall()
+        "SELECT f.fid, f.quality, f.slug FROM files f LEFT JOIN titles t ON t.slug=f.slug "
+        "WHERE (f.host='wall' OR (f.res_err IS NOT NULL AND f.res_err LIKE '%403%') "
+        "OR (f.host='unknown' AND f.res_err IS NULL AND (length(f.fid) = 8 OR length(f.fid) >= 20))) "
+        "AND NOT (f.res_err IS NOT NULL AND f.res_err NOT LIKE '%403%' AND COALESCE(f.resolved_at, 0) > ?) "
+        "ORDER BY (COALESCE(t.badges, '') LIKE '%Adult%') DESC, (f.res_err IS NULL) DESC, COALESCE(t.published, '') DESC, f.quality DESC LIMIT ?",
+        (int(time.time()) - 6 * 3600, args.limit)).fetchall()
     if not rows:
         print("[browser] nothing behind the wall", flush=True)
         return 0
@@ -1061,7 +1159,19 @@ def cmd_bresolve(args):
                     try:
                         title, btns = await _br_page(page, fid)
                         out.update(_br_class(btns))
-                        if not btns:
+                        if btns and out["host"] not in ("r2", "r2zip"):
+                            fsl = await _br_fsl(page, conn, btns)
+                            if fsl:
+                                out.update(fsl)
+                                if out["host"] == "wall":
+                                    why = "relay"
+                        if not btns and "link expired" in title.lower():
+                            # the code is a day old: the title page is read again for fresh codes (store_title keeps
+                            # what its other files already resolved)
+                            why = "expired"
+                            out["host"], out["err"] = "expired", "link expired"
+                            write_retry(conn, "UPDATE titles SET fetched_at=NULL WHERE slug=?", (r["slug"],))
+                        elif not btns:
                             why = "moment" if "moment" in title.lower() else ("notfound" if "not found" in title.lower() or not title else "nobuttons")
                             out["host"], out["err"] = "wall", f"no buttons ({why})"
                         if out["host"] == "r2":
