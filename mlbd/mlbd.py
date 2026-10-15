@@ -429,6 +429,20 @@ FRESH: dict[str, float] = {}
 FRESH_S = int(os.environ.get("MLBD_FRESH_S", "600"))
 
 
+def resend_filmlike_once(conn) -> None:
+    """One-time (2026-10-15): series-typed posts whose files carry no season were sent as "tv" and could not play; send
+    them again (payload() now sends them as films)."""
+    if conn.execute("SELECT v FROM meta WHERE k='filmlike_20261015'").fetchone():
+        return
+    n = conn.execute("UPDATE titles SET pushed_hash=NULL WHERE pushed_hash IS NOT NULL AND kind IN ('series','drama','anime') "
+                     "AND NOT EXISTS(SELECT 1 FROM episodes e WHERE e.path=titles.path) "
+                     "AND EXISTS(SELECT 1 FROM files f WHERE f.path=titles.path) "
+                     "AND NOT EXISTS(SELECT 1 FROM files f WHERE f.path=titles.path AND f.season IS NOT NULL)").rowcount
+    meta_set(conn, "filmlike_20261015", str(n))
+    conn.commit()
+    print(f"[reset] {n} film-like series will be sent again as films", flush=True)
+
+
 def reset_stale_once(conn) -> None:
     """One-time (2026-10-14): retry what the stale-link bug and the cookie bug marked as failed, now, not in 24 hours."""
     if conn.execute("SELECT v FROM meta WHERE k='reset_stale_20261014'").fetchone():
@@ -507,13 +521,19 @@ def payload(conn, path: str) -> dict:
     if poster and "image.tmdb.org" in poster:
         poster = poster.replace("/original/", "/w500/")
     kind = "tv" if t["kind"] in ("series", "drama") or (t["kind"] == "anime" and eps) else "movie"
+    # A post typed "series" that lists its files like a film (no episode cards, every file without a season) goes out
+    # as a film (Viktor, 2026-10-15): as "tv" the app asked for season 1 and found no file, so it could not play
+    # (measured: "Ek Anjaan Rishtey Ka Guilt 5"). ":m" changes the hash, so the worker rewrites a title already sent.
+    as_film = kind == "tv" and not eps and bool(files) and all(f["season"] is None for f in files)
+    if as_film:
+        kind = "movie"
     mx = max([f["bytes"] or 0 for f in files] + [0])
     return {
         "num": BASE_NUM + int(t["cid"]), "slug": "mlbd-" + path.strip("/").replace("/", "-"), "type": kind, "title": t["title"], "aka": t["aka"],
         "year": t["year"], "poster": poster, "overview": t["overview"], "genres": t["genres"], "language": t["language"],
         "country": None, "rating": t["rating"], "releaseDate": None, "runtime": None, "tmdbId": None, "imdbId": None, "status": t["status"],
         "cats": ",".join(x for x in (t["kind"].title() if t["kind"] else None, t["language"]) if x), "ott": None, "badges": "Adult" if path.startswith("/download18plus/") else None,
-        "published": None, "modified": None, "hash": f"{t['hash']}:{mx}", "episodes": eps, "files": files,
+        "published": None, "modified": None, "hash": f"{t['hash']}:{mx}" + (":m" if as_film else ""), "episodes": eps, "files": files,
     }
 
 
@@ -608,6 +628,7 @@ async def run(args) -> None:
         print("[mlbd] challenge passed", flush=True)
         try:
             reset_stale_once(conn)
+            resend_filmlike_once(conn)
             if args.cmd in ("index", "cycle"):
                 await do_index(s, conn, getattr(args, "shards", False) or not conn.execute("SELECT 1 FROM items LIMIT 1").fetchone(), args.listing)
             if args.cmd == "crawl":
