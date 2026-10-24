@@ -1518,11 +1518,78 @@ def cmd_skipcheck(args):
     print(f"[skip] checked {done}, spoken advert in {found}", flush=True)
 
 
+def cmd_recheck(args):
+    """The stored direct links rot (owner, 2026-10-25).
+    =============================================================================
+    *"cinefreak ও movielinkbd এরগুলোর অনেকগুলোই চলে না... যেগুলো আগে থেকেই এসে ছিলো"*. Live
+    2026-10-25: a 45-title random play sample through the gateway answered 6 ok / 35 no_server /
+    4 no_file, and the newest 20 titles answered 5 ok / 15 no_server — while the file host itself
+    was healthy (fsldownload.com 200; a known-good stored pair still ranged 206 on a 1.88 GB and a
+    3.68 GB MKV). So the index stores links that die: the host deletes old uploads and issues fresh
+    file codes on every page re-read, and nothing ever looked at a link again after resolve proved
+    it once. The gateway can only prove what the index stores, so a dead stored link plays as
+    "no server" for weeks.
+
+    The cure: one cheap ranged GET per stored link, oldest resolved first; a healthy link gets its
+    resolved_at renewed (so coverage keeps rotating through the whole index), a dead one is marked
+    res_err='dead' with resolved_at=0 so this run's resolve re-resolves it — the browser pass
+    covers the Turnstile wall, and a genuinely deleted file falls out of play honestly instead of
+    serving a dead link. Bumping resolved_at also changes a title's push hash, so freshly
+    re-proven titles are re-pushed and the library API stops promising what cannot play.
+    """
+    conn = db()
+    rows = conn.execute(
+        "SELECT f.fid, f.url FROM files f WHERE f.host IN ('r2','r2zip') AND f.url IS NOT NULL "
+        "ORDER BY COALESCE(f.resolved_at, 0) ASC LIMIT ?", (args.limit,)).fetchall()
+    by = min(deadline_of("RESOLVE"), time.time() + float(os.environ.get("LIB_RECHECK_SECONDS", "240")))
+    print(f"[recheck] {len(rows)} stored links, oldest resolved first", flush=True)
+    alive = dead = 0
+    ex = ThreadPoolExecutor(max_workers=RCONC)
+    pending: list = []
+
+    def flush():
+        nonlocal pending
+        for i in range(30):
+            try:
+                conn.executemany("UPDATE files SET resolved_at=? WHERE fid=?", pending)
+                conn.commit()
+                break
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e) or i == 29:
+                    raise
+                conn.rollback()
+                time.sleep(1 + i * 0.5)
+        pending = []
+
+    try:
+        futs = {ex.submit(_range_size, r["url"]): r["fid"] for r in rows}
+        for fut in as_completed(futs):
+            if time.time() > by:
+                for f in futs: f.cancel()
+                break
+            fid = futs[fut]
+            if fut.result() is not None:
+                alive += 1
+                pending.append((int(time.time()), fid))
+            else:
+                dead += 1
+                pending.append((0, fid))          # resolved_at=0: resolve re-picks it this run
+            if len(pending) >= 100:
+                flush()
+        flush()
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
+    conn.commit()
+    print(f"[recheck] alive {alive}, dead {dead}", flush=True)
+    return dead
+
+
 def cmd_cycle(args):
     """One scheduled run: crawl what changed, then resolve and push in rounds until the time budget is spent."""
     cmd_crawl(args)
     args.limit = 100000
     cmd_skipcheck(args)
+    cmd_recheck(args)
     by = deadline_of("RESOLVE")
     while time.time() < by - 60:
         args.limit = args.round
@@ -1583,6 +1650,9 @@ def main():
     k = sub.add_parser("skipcheck")
     k.add_argument("--limit", type=int, default=100000)
     k.set_defaults(fn=cmd_skipcheck)
+    r2 = sub.add_parser("recheck")
+    r2.add_argument("--limit", type=int, default=100000)
+    r2.set_defaults(fn=cmd_recheck)
     p = sub.add_parser("push")
     p.add_argument("--base")
     p.add_argument("--key")
