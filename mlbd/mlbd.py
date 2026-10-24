@@ -505,6 +505,58 @@ async def do_resolve(s, conn, limit: int) -> int:
     return n
 
 
+async def do_recheck(conn, limit: int) -> int:
+    """The stored direct links rot (owner, 2026-10-25).
+    =============================================================================
+    *"movielinkbd এরগুলো আসলেও কি যেনো সমস্যার কারণে কিছু ঘণ্টা পর চলে না"*. Live 2026-10-25:
+    a 45-title random play sample through the gateway answered 6 ok / 35 no_server / 4 no_file —
+    the file host healthy, the index's stored links dead. Nothing ever looked at a resolved link
+    again. One cheap ranged GET per stored link, oldest resolved first (see cinefreak.py
+    cmd_recheck for the full owner note): a healthy link gets resolved_at renewed (coverage
+    rotates through the whole index, and the push hash changes so the title is re-pushed), a dead
+    one gets res_err='dead link', resolved_at=0 so this run's resolve re-resolves it while the
+    page's button is still there.
+    """
+    rows = conn.execute(
+        "SELECT fid, url FROM files WHERE host='r2' AND url IS NOT NULL "
+        "ORDER BY COALESCE(resolved_at, 0) ASC LIMIT ?", (limit,)).fetchall()
+    by = min(deadline("RESOLVE"), time.time() + float(os.environ.get("LIB_RECHECK_SECONDS", "240")))
+    print(f"[recheck] {len(rows)} stored links, oldest resolved first", flush=True)
+    alive = dead = n = 0
+
+    def alive_of(url: str) -> bool:
+        try:
+            return check_direct(url)[2] is None
+        except Exception:
+            return False
+
+    async def one(r):
+        return r["fid"], await asyncio.to_thread(alive_of, r["url"])
+
+    tasks = [one(r) for r in rows]
+    try:
+        for fut in asyncio.as_completed(tasks):
+            if time.time() > by:
+                for t in tasks: t.cancel()
+                break
+            fid, ok = await fut
+            if ok:
+                alive += 1
+                conn.execute("UPDATE files SET resolved_at=? WHERE fid=?", (int(time.time()), fid))
+            else:
+                dead += 1
+                conn.execute("UPDATE files SET resolved_at=0, res_err='dead link' WHERE fid=?", (fid,))
+            n += 1
+            if n % 50 == 0:
+                conn.commit()
+                print(f"[recheck] {n}/{len(rows)} alive {alive} dead {dead} req={n}", flush=True)
+    finally:
+        pass
+    conn.commit()
+    print(f"[recheck] alive {alive}, dead {dead}", flush=True)
+    return dead
+
+
 # ---------------------------------------------------------------- push
 
 def payload(conn, path: str) -> dict:
@@ -616,6 +668,8 @@ async def run(args) -> None:
     conn = db()
     if args.cmd == "stats":
         stats(conn); return
+    if args.cmd == "recheck":
+        await do_recheck(conn, args.limit); return
     if args.cmd == "push":
         do_push(conn, args.base or os.environ.get("LIB_BASE", ""), args.key or os.environ.get("LIB_KEY", "")); return
     from patchright.async_api import async_playwright
@@ -638,6 +692,7 @@ async def run(args) -> None:
             if args.cmd == "cycle":
                 base, key = os.environ.get("LIB_BASE", ""), os.environ.get("LIB_KEY", "")
                 await do_crawl(s, conn, args.limit)
+                await do_recheck(conn, args.limit)
                 by = deadline("RESOLVE")
                 while time.time() < by - 60:
                     n = await do_resolve(s, conn, args.round)
@@ -657,6 +712,7 @@ def main():
     i = sub.add_parser("index"); i.add_argument("--shards", action="store_true"); i.add_argument("--listing", type=int, default=3)
     c = sub.add_parser("crawl"); c.add_argument("--limit", type=int, default=100000)
     r = sub.add_parser("resolve"); r.add_argument("--limit", type=int, default=100000)
+    k = sub.add_parser("recheck"); k.add_argument("--limit", type=int, default=100000)
     p = sub.add_parser("push"); p.add_argument("--base"); p.add_argument("--key")
     y = sub.add_parser("cycle"); y.add_argument("--listing", type=int, default=3); y.add_argument("--limit", type=int, default=100000)
     y.add_argument("--round", type=int, default=300)
