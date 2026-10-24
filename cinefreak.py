@@ -1551,7 +1551,7 @@ def cmd_recheck(args):
         nonlocal pending
         for i in range(30):
             try:
-                conn.executemany("UPDATE files SET resolved_at=? WHERE fid=?", pending)
+                conn.executemany("UPDATE files SET resolved_at=?, res_err=? WHERE fid=?", pending)
                 conn.commit()
                 break
             except sqlite3.OperationalError as e:
@@ -1570,10 +1570,10 @@ def cmd_recheck(args):
             fid = futs[fut]
             if fut.result() is not None:
                 alive += 1
-                pending.append((int(time.time()), fid))
+                pending.append((int(time.time()), None, fid))   # res_err cleared: proven again now
             else:
                 dead += 1
-                pending.append((0, fid))          # resolved_at=0: resolve re-picks it this run
+                pending.append((0, "dead", fid))                # resolved_at=0 + res_err: resolve re-picks it this run
             if len(pending) >= 100:
                 flush()
         flush()
