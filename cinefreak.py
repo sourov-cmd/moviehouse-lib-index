@@ -900,7 +900,14 @@ def cmd_crawl(args):
 def resolve_one(fid: str, watch: int) -> tuple[str, dict]:
     out = {"host": None, "url": None, "sub_url": None, "bytes": None, "err": None, "start_ms": None}
     try:
-        f = parse_file_page(fetch(f"https://new5.cinecloud.site/f/{fid}", tries=2))
+        page_html = fetch(f"https://new5.cinecloud.site/f/{fid}", tries=2)
+        # 2026-10-25: the site itself answers its real page when the code is known (a healthy code answers
+        # plain, probed) and 'File not Found' when the code is dead/rotated. The dead buckets' old codes all
+        # answer not found (10/10 probed) — chase the title, not the code.
+        if re.search(r"file not found", (re.search(r"<title>([^<]+)</title>", page_html) or (None, ""))[1] or "", re.I):
+            out["host"], out["err"] = "gone", "file not found (site)"
+            return fid, out
+        f = parse_file_page(page_html)
         out.update(f)
         if f["host"] == "gd":
             # A Drive copy: '/w/<fid>' names a fresh googleusercontent link (works from any network, no
@@ -1122,8 +1129,18 @@ def cmd_bresolve(args):
     async def run():
         n = 0
         async with async_playwright() as p:
+            launch_kw: dict = {}
+            # 2026-10-25: Turnstile has rejected the runners' browsers since ~22 Oct (the widget's own
+            # challenge call answers 401, probed). The site is Bangladesh-targeted; the owner's residential
+            # BD proxy is the best-odds lane, wired only when the secrets are set.
+            if os.environ.get("LIB_PROXY_SERVER"):
+                launch_kw["proxy"] = {"server": os.environ["LIB_PROXY_SERVER"]}
+                if os.environ.get("LIB_PROXY_USER"):
+                    launch_kw["proxy"]["username"] = os.environ["LIB_PROXY_USER"]
+                    launch_kw["proxy"]["password"] = os.environ.get("LIB_PROXY_PASS", "")
+                print("[browser] going through the proxy lane", flush=True)
             ctx = await p.chromium.launch_persistent_context(os.environ.get("LIB_BROWSER_PROFILE", "/tmp/lib-prof"), channel="chromium",
-                                                             headless=False, no_viewport=True)
+                                                             headless=False, no_viewport=True, **launch_kw)
 
             async def block(route):
                 await route.abort()
@@ -1212,7 +1229,7 @@ def cmd_bresolve(args):
 def cmd_resolve(args):
     conn = db()
     rows = conn.execute(
-        "SELECT f.fid, f.watch, f.url FROM files f LEFT JOIN titles t ON t.slug=f.slug "
+        "SELECT f.fid, f.watch, f.url, f.slug FROM files f LEFT JOIN titles t ON t.slug=f.slug "
         "WHERE (length(f.fid) = 8 OR length(f.fid) >= 20) AND f.host != 'gone' AND (f.resolved_at IS NULL OR (f.host IN ('unknown') AND f.resolved_at < ?) OR (f.res_err IS NOT NULL AND f.resolved_at < ?)) "
         "ORDER BY (f.res_err='dead' AND f.resolved_at=0) DESC, COALESCE(t.published, '') DESC, f.watch DESC, f.rowid DESC LIMIT ?",
         (int(time.time()) - 86400, int(time.time()) - 6 * 3600, args.limit)).fetchall()
@@ -1257,6 +1274,7 @@ def cmd_resolve(args):
                 time.sleep(1)
 
     ex = ThreadPoolExecutor(max_workers=RCONC)
+    slug_of = {r["fid"]: r["slug"] for r in rows}
     try:
         futs = [ex.submit(resolve_one, r["fid"], r["watch"]) for r in rows]
         for fut in as_completed(futs):
@@ -1266,6 +1284,19 @@ def cmd_resolve(args):
                 break
             fid, out = fut.result()
             pending.append((out["host"], out["url"], out["sub_url"], out["bytes"], int(time.time()), out["err"], out["start_ms"], fid))
+            if out["host"] == "gone":
+                # the code is dead: the title page is re-read (its current codes are the way back; the old
+                # row drops out of the payload on the next store_title)
+                for i in range(30):
+                    try:
+                        conn.execute("UPDATE titles SET fetched_at=NULL WHERE slug=?", (slug_of[fid],))
+                        conn.commit()
+                        break
+                    except sqlite3.OperationalError as e:
+                        if "locked" not in str(e) or i == 29:
+                            raise
+                        conn.rollback()
+                        time.sleep(1 + i * 0.5)
             n += 1
             if len(pending) >= 25:
                 flush()
