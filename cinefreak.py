@@ -1222,7 +1222,7 @@ def cmd_resolve(args):
             now = int(time.time())
             for i in range(30):
                 try:
-                    was_dead = {(r["fid"]) for r in rows if r.get("url") and any(r["url"].startswith(h) for h in DEAD_R2_PREFIXES)}
+                    was_dead = {r["fid"] for r in rows if r["url"] and any(r["url"].startswith(h) for h in DEAD_R2_PREFIXES)}
                     conn.executemany("UPDATE files SET host='wall', url=NULL, resolved_at=?, res_err=NULL WHERE fid=?", [(now, r["fid"]) for r in rows])
                     conn.executemany("UPDATE files SET res_err='dead' WHERE fid=?", [(f,) for f in was_dead])
                     conn.commit()
