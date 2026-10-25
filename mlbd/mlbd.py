@@ -48,6 +48,7 @@ from mlbd_dec import dec  # noqa: E402
 DB_PATH = os.environ.get("MLBD_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mlbd.sqlite"))
 QUIET = os.environ.get("LIB_QUIET") == "1"
 DAILY_ROWS = int(os.environ.get("LIB_DAILY_ROWS", "40000"))   # this source's share of the D1 free plan (100k rows/day)
+RELINK_RESERVE = int(os.environ.get("LIB_RELINK_RESERVE", "20000"))  # the link renewals always keep this much of the day's budget
 ROW_FACTOR = float(os.environ.get("LIB_ROW_FACTOR", "4.0"))
 BASE_NUM = 2_100_000_000
 KINDS = ("movie", "series", "drama", "anime", "download18plus")  # 18+ posts carry badges "Adult"
@@ -471,11 +472,29 @@ async def do_resolve(s, conn, limit: int) -> int:
     print(f"[resolve] {len(rows)} files", flush=True)
     n, stat = 0, {}
     refetched = 0
+    # owner 2026-10-25: the site answers each request in ~2 s, so one-sequential-request-per-hop
+    # resolved only ~1.2k files/h while ~2.4k/h cross the 23.1 h link-expiry line. Both hops are
+    # ordinary page reads, so they go through get_many (4 in parallel, the way crawl reads pages):
+    # a title's /file/ pages together, then that title's fsl pages together.
+    groups: list[list] = []
     for r in rows:
+        if groups and groups[-1][0]["path"] == r["path"]:
+            groups[-1].append(r)
+        else:
+            groups.append([r])
+
+    def mark(fid: str, url, size, name, err):
+        host = "r2" if url and not err else None
+        key = "ok" if host else " ".join((err or "?").split(" ")[:2])
+        stat[key] = stat.get(key, 0) + 1
+        conn.execute("UPDATE files SET host=?, url=?, bytes=?, fname=?, resolved_at=?, res_err=? WHERE fid=?",
+                     (host, url if host else None, size, name, int(time.time()), err, fid))
+
+    for g in groups:
         if time.time() > by:
             say(f"[resolve] time budget reached at {n}/{len(rows)}")
             break
-        path = r["path"]
+        path = g[0]["path"]
         if time.time() - FRESH.get(path, 0) > FRESH_S:
             await s.tidy()
             st, x, _ = await s.get(path, PACE)
@@ -485,23 +504,46 @@ async def do_resolve(s, conn, limit: int) -> int:
                 store_title(conn, parse_title(x), path)
             else:
                 conn.execute("UPDATE items SET fetched_at=?, err=? WHERE path=?", (int(time.time()), f"http {st}", path))
-        cur = conn.execute("SELECT aurl FROM files WHERE fid=?", (r["fid"],)).fetchone()
-        if not cur or not cur["aurl"]:
-            continue   # the button is gone from the page: store_title deleted the file
-        url, err, size, name = None, None, None, None
-        try:
-            url, err = await resolve_file(s, cur["aurl"])
-            if url:
-                size, name, err = await asyncio.to_thread(check_direct, url)
-        except Exception as e:  # noqa: BLE001
-            err = str(e)[:150]
-        host = "r2" if url and not err else None
-        key = "ok" if host else " ".join((err or "?").split(" ")[:2])
-        stat[key] = stat.get(key, 0) + 1
-        conn.execute("UPDATE files SET host=?, url=?, bytes=?, fname=?, resolved_at=?, res_err=? WHERE fid=?",
-                     (host, url if host else None, size, name, int(time.time()), err, r["fid"]))
-        n += 1
-        if n % 20 == 0:
+        fids = [r["fid"] for r in g]
+        cur = {r["fid"]: r["aurl"] for r in conn.execute(
+            f"SELECT fid, aurl FROM files WHERE fid IN ({','.join('?' * len(fids))})", fids).fetchall()}
+        todo = [(fid, a) for fid, a in ((fid, cur.get(fid)) for fid in fids) if a]
+        # hop 1: the /file/ pages (batched)
+        pages = await s.get_many([a for _, a in todo], PACE)
+        hops, done = [], []
+        for (fid, _a), r in zip(todo, pages):
+            st, x = r[0], r[1]
+            if st != 200:
+                done.append((fid, None, None, None, f"A http {st}"))
+                continue
+            fsl = [_attrs(t).get("href") for t in re.findall(r'<a\b[^>]*data-host="fsl"[^>]*>', x)]
+            fsl = [u for u in fsl if u]
+            if not fsl:
+                hosts = sorted({_attrs(t).get("data-host") for t in re.findall(r'<a\b[^>]*data-host="[^"]+"[^>]*>', x)})
+                done.append((fid, None, None, None, "no fsl (" + ",".join(h for h in hosts if h)[:60] + ")"))
+                continue
+            hops.append((fid, fsl[0]))
+        # hop 2: the fsl pages (batched)
+        direct = await s.get_many([u for _, u in hops], PACE) if hops else []
+        fetched = []
+        for (fid, _u), r in zip(hops, direct):
+            st, x = r[0], r[1]
+            if st != 200:
+                done.append((fid, None, None, None, f"B http {st}"))
+                continue
+            d = re.findall(r'href="(https://fsldownload\.com/d/[^"]+)"', x)
+            if not d:
+                done.append((fid, None, None, None, "no direct link"))
+                continue
+            fetched.append((fid, unescape(d[0])))
+        # the ranged proof is plain urllib (no session): all of a title's files together
+        proofs = await asyncio.gather(*[asyncio.to_thread(check_direct, u) for _, u in fetched]) if fetched else []
+        for (fid, u), (size, name, perr) in zip(fetched, proofs):
+            done.append((fid, u, size, name, perr))
+        for fid, url, size, name, err in done:
+            mark(fid, url, size, name, err)
+            n += 1
+        if n and (n // 20) != ((n - len(done)) // 20):
             conn.commit()
             print(f"[resolve] {n}/{len(rows)} {json.dumps(stat, sort_keys=True)} re-read {refetched} req={s.nreq}", flush=True)
     conn.commit()
@@ -614,7 +656,7 @@ def do_relink(conn, base: str, key: str) -> int:
     sent = 0
     for i in range(0, len(rows), 250):
         part = rows[i:i + 250]
-        if spent + len(part) > budget:
+        if spent + len(part) > DAILY_ROWS:
             break
         body = json.dumps({"files": [{"fid": r["fid"], "url": r["url"]} for r in part]}).encode()
         req = urllib.request.Request(base.rstrip("/") + "/relink", data=body, method="POST",
@@ -646,7 +688,7 @@ def do_relink(conn, base: str, key: str) -> int:
 def do_push(conn, base: str, key: str, limit: int = 100000, batch: int = 25) -> int:
     day = time.strftime("%Y-%m-%d", time.gmtime())
     spent = int(meta_get(conn, f"rows:{day}", 0))
-    budget = DAILY_ROWS - spent
+    budget = DAILY_ROWS - RELINK_RESERVE - spent
     if budget <= 0:
         say(f"[push] today's D1 write budget is used ({spent} est. rows)")
         return 0
