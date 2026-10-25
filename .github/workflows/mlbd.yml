@@ -63,9 +63,10 @@ jobs:
           fi
       - name: Index, crawl, resolve, push
         run: |
-          M="${{ inputs.minutes }}"; L="${{ inputs.listing }}"; M="${M:-50}"; L="${L:-3}"
+          M="${{ inputs.minutes }}"; L="${{ inputs.listing }}"; M="${M:-85}"; L="${L:-3}"
           now=$(date +%s)
           export MLBD_CRAWL_BY=$((now + M*60*2/5)) MLBD_RESOLVE_BY=$((now + M*60))
+          export LIB_RECHECK_SECONDS=120
           if [ "$TEST" = "1" ]; then
             export MLBD_CRAWL_BY=$((now + 15*60)) MLBD_RESOLVE_BY=$((now + 40*60))
             xvfb-run -a python3 mlbd/mlbd.py cycle --listing 2 --limit 200 --round 250 2>&1 | grep -v -E "ERROR|inotify|dbus" || true
