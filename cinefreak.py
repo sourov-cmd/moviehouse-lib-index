@@ -1524,7 +1524,7 @@ DEAD_R2_PREFIXES = [h.strip() for h in os.environ.get("LIB_DEAD_R2", "").split("
 # measured 2026-10-25: pub-eb0dd3d4... (2,765 files) and pub-8b46bbc5... (1,425 files) answer 403
 # Forbidden (their r2.dev subdomain is gone); every other stored bucket answers 206.
 if not DEAD_R2_PREFIXES:
-    DEAD_R2_PREFIXES = ["https://pub-eb0dd3d4c4c84462bc3e3f1f8a3f", "https://pub-8b46bbc58f8c4eb084601251ab7c"]
+    DEAD_R2_PREFIXES = ["https://pub-eb0dd3d4c4c84462bc3e3f1f8a3f1b61", "https://pub-8b46bbc58f8c4eb084601251ab7c7f58"]
 
 
 def cmd_recheck(args):
