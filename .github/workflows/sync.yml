@@ -55,7 +55,7 @@ jobs:
       # 15k left for the shelf flags and the app (free plan: 100k/day).
       LIB_BROWSER: "1"
       LIB_BROWSER_ROUND: "300"
-      LIB_BROWSER_TABS: "3"
+      LIB_BROWSER_TABS: "5"
       LIB_DAILY_ROWS: "45000"
       LIB_QUIET: "1"
       # A second egress lane (owner's Bright Data proxy, 2026-10-11): the source allows ~2 requests/s per IP,
