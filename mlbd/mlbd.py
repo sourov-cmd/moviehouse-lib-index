@@ -49,6 +49,7 @@ DB_PATH = os.environ.get("MLBD_DB", os.path.join(os.path.dirname(os.path.abspath
 QUIET = os.environ.get("LIB_QUIET") == "1"
 DAILY_ROWS = int(os.environ.get("LIB_DAILY_ROWS", "40000"))   # this source's share of the D1 free plan (100k rows/day)
 RELINK_RESERVE = int(os.environ.get("LIB_RELINK_RESERVE", "20000"))  # the link renewals always keep this much of the day's budget
+RELINK_ROWS = int(os.environ.get("LIB_RELINK_ROWS", "45000"))  # real rows the renewals may spend per day (1 row/file, measured)
 ROW_FACTOR = float(os.environ.get("LIB_ROW_FACTOR", "4.0"))
 BASE_NUM = 2_100_000_000
 KINDS = ("movie", "series", "drama", "anime", "download18plus")  # 18+ posts carry badges "Adult"
@@ -647,10 +648,13 @@ def do_relink(conn, base: str, key: str) -> int:
     ingest cost that is ~90k rows/day against a 100k/day free plan; at relink cost ~56k. Only
     metadata-unchanged titles are relinked; anything the page changed goes through /ingest."""
     day = time.strftime("%Y-%m-%d", time.gmtime())
-    spent = int(meta_get(conn, f"rows:{day}", 0))
-    budget = DAILY_ROWS - spent
-    if budget <= 0:
-        say(f"[relink] today's D1 write budget is used ({spent} est. rows)")
+    # owner 2026-10-25: relink is billed ~1 real row per file (verified: est +2,761 vs D1's real
+    # 2,805 in the 06:00 hour), while the shared push estimate runs ~1.5x over the real D1 count
+    # (est 77.7k vs measured 51.2k). One conservative estimate must not starve the renewals, so
+    # relink keeps its own real-rows counter with its own cap.
+    spent = int(meta_get(conn, f"relinkrows:{day}", 0))
+    if spent + 250 > RELINK_ROWS:
+        say(f"[relink] today's relink row budget is used ({spent}/{RELINK_ROWS} real rows)")
         return 0
     rows = conn.execute(
         "SELECT f.fid, f.url FROM files f JOIN titles t ON t.path=f.path "
@@ -661,7 +665,7 @@ def do_relink(conn, base: str, key: str) -> int:
     sent = 0
     for i in range(0, len(rows), 250):
         part = rows[i:i + 250]
-        if spent + len(part) > DAILY_ROWS:
+        if spent + len(part) > RELINK_ROWS:
             break
         body = json.dumps({"files": [{"fid": r["fid"], "url": r["url"]} for r in part]}).encode()
         req = urllib.request.Request(base.rstrip("/") + "/relink", data=body, method="POST",
@@ -681,12 +685,12 @@ def do_relink(conn, base: str, key: str) -> int:
             raise RuntimeError("relink refused")
         used = int(res.get("rows_written") or 0) + 1  # +1: the lib_meta updated_at write
         spent += used
-        meta_set(conn, f"rows:{day}", spent)
+        meta_set(conn, f"relinkrows:{day}", spent)
         for r in part:
             conn.execute("UPDATE files SET pushed_url=? WHERE fid=?", (r["url"], r["fid"]))
         conn.commit()
         sent += len(part)
-    print(f"[relink] done {sent} files, est.rows today={spent}", flush=True)
+    print(f"[relink] done {sent} files, relink rows today={spent}/{RELINK_ROWS}", flush=True)
     return sent
 
 
