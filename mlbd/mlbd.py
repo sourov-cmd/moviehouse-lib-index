@@ -89,6 +89,10 @@ def db() -> sqlite3.Connection:
     c = sqlite3.connect(DB_PATH, timeout=60)
     c.row_factory = sqlite3.Row
     c.executescript(SCHEMA)
+    try:  # 2026-10-25: what the Library worker already holds for this file (relink sends only the difference)
+        c.execute("ALTER TABLE files ADD COLUMN pushed_url TEXT")
+    except sqlite3.OperationalError:
+        pass
     return c
 
 
@@ -589,6 +593,56 @@ def payload(conn, path: str) -> dict:
     }
 
 
+def do_relink(conn, base: str, key: str) -> int:
+    """Renew only the fsldownload links: POST /relink writes ONE row per file, a full ingest
+    writes ~2 + files + episodes rows per title. The stored links die after ~23.1 h (measured,
+    lib-worker relink note), so a living library needs every file renewed roughly daily — at full
+    ingest cost that is ~90k rows/day against a 100k/day free plan; at relink cost ~56k. Only
+    metadata-unchanged titles are relinked; anything the page changed goes through /ingest."""
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    spent = int(meta_get(conn, f"rows:{day}", 0))
+    budget = DAILY_ROWS - spent
+    if budget <= 0:
+        say(f"[relink] today's D1 write budget is used ({spent} est. rows)")
+        return 0
+    rows = conn.execute(
+        "SELECT f.fid, f.url FROM files f JOIN titles t ON t.path=f.path "
+        "WHERE f.host='r2' AND f.url IS NOT NULL AND (f.pushed_url IS NULL OR f.pushed_url IS NOT f.url) "
+        "AND t.pushed_hash IS NOT NULL ORDER BY f.rowid LIMIT 3000").fetchall()
+    if not rows:
+        return 0
+    sent = 0
+    for i in range(0, len(rows), 250):
+        part = rows[i:i + 250]
+        if spent + len(part) > budget:
+            break
+        body = json.dumps({"files": [{"fid": r["fid"], "url": r["url"]} for r in part]}).encode()
+        req = urllib.request.Request(base.rstrip("/") + "/relink", data=body, method="POST",
+                                     headers={"content-type": "application/json", "x-lib-key": key,
+                                              "user-agent": "MovieHouse-LibIndex/2"})
+        res = None
+        for k in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    res = json.loads(r.read().decode())
+                break
+            except Exception:  # noqa: BLE001
+                if k == 3:
+                    raise
+                time.sleep(5 * (k + 1))
+        if not res or not res.get("ok"):
+            raise RuntimeError("relink refused")
+        used = int(res.get("rows_written") or 0) + 1  # +1: the lib_meta updated_at write
+        spent += used
+        meta_set(conn, f"rows:{day}", spent)
+        for r in part:
+            conn.execute("UPDATE files SET pushed_url=? WHERE fid=?", (r["url"], r["fid"]))
+        conn.commit()
+        sent += len(part)
+    print(f"[relink] done {sent} files, est.rows today={spent}", flush=True)
+    return sent
+
+
 def do_push(conn, base: str, key: str, limit: int = 100000, batch: int = 25) -> int:
     day = time.strftime("%Y-%m-%d", time.gmtime())
     spent = int(meta_get(conn, f"rows:{day}", 0))
@@ -602,7 +656,13 @@ def do_push(conn, base: str, key: str, limit: int = 100000, batch: int = 25) -> 
         "WHERE t.cid IS NOT NULL AND NOT EXISTS(SELECT 1 FROM files f WHERE f.path=t.path AND f.resolved_at IS NULL) "
         "AND (t.pushed_hash IS NOT NULL OR EXISTS(SELECT 1 FROM files f WHERE f.path=t.path AND f.host='r2')) "
         "ORDER BY t.fetched_at DESC LIMIT ?", (limit,)).fetchall()
-    rows = [r for r in rows if conn.execute("SELECT pushed_hash FROM titles WHERE path=?", (r["path"],)).fetchone()[0] != f"{conn.execute('SELECT hash FROM titles WHERE path=?', (r['path'],)).fetchone()[0]}:{r['mx']}"]
+    # owner 2026-10-25: a title whose page is unchanged needs only its links renewed (do_relink);
+    # the old rule re-ingested every resolved title (~7 rows each), which a daily link sweep cannot afford.
+    def hash_only(path):
+        ph = conn.execute("SELECT pushed_hash FROM titles WHERE path=?", (path,)).fetchone()[0]
+        h = conn.execute("SELECT hash FROM titles WHERE path=?", (path,)).fetchone()[0]
+        return ph is not None and ph.rsplit(":", 1)[0] == h
+    rows = [r for r in rows if not hash_only(r["path"])]
     print(f"[push] {len(rows)} titles waiting; budget {budget} est. rows today", flush=True)
     sent = used = 0
     cur: list = []
@@ -629,6 +689,7 @@ def do_push(conn, base: str, key: str, limit: int = 100000, batch: int = 25) -> 
         for p, path, mx in cur:
             h = conn.execute("SELECT hash FROM titles WHERE path=?", (path,)).fetchone()[0]
             conn.execute("UPDATE titles SET pushed_hash=? WHERE path=?", (f"{h}:{mx}", path))
+            conn.execute("UPDATE files SET pushed_url=url WHERE path=? AND url IS NOT NULL", (path,))
         used += max(int(int(res.get("written") or 0) * ROW_FACTOR), len(cur))
         meta_set(conn, f"rows:{day}", spent + used)
         conn.commit()
@@ -700,6 +761,7 @@ async def run(args) -> None:
                 while time.time() < by - 60:
                     n = await do_resolve(s, conn, args.round)
                     if base and key and os.environ.get("MLBD_PUSH") == "1":
+                        do_relink(conn, base, key)
                         do_push(conn, base, key)
                     if n == 0:
                         break
