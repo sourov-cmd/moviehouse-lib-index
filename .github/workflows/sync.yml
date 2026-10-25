@@ -56,6 +56,9 @@ jobs:
       LIB_BROWSER: "1"
       LIB_BROWSER_ROUND: "300"
       LIB_BROWSER_TABS: "5"
+      LIB_PROXY_SERVER: "http://${{ secrets.BD_PROXY_SERVER }}"
+      LIB_PROXY_USER: ${{ secrets.BD_PROXY_USER }}
+      LIB_PROXY_PASS: ${{ secrets.BD_PROXY_PASS }}
       LIB_DAILY_ROWS: "45000"
       LIB_QUIET: "1"
       # A second egress lane (owner's Bright Data proxy, 2026-10-11): the source allows ~2 requests/s per IP,
