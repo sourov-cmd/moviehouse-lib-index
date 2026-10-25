@@ -537,7 +537,12 @@ async def do_resolve(s, conn, limit: int) -> int:
                 continue
             fetched.append((fid, unescape(d[0])))
         # the ranged proof is plain urllib (no session): all of a title's files together
-        proofs = await asyncio.gather(*[asyncio.to_thread(check_direct, u) for _, u in fetched]) if fetched else []
+        async def _proof(u):
+            try:
+                return await asyncio.to_thread(check_direct, u)
+            except Exception as e:  # noqa: BLE001  (403/410 answer as an error, not a crash)
+                return (None, None, str(e)[:150])
+        proofs = await asyncio.gather(*[_proof(u) for _, u in fetched]) if fetched else []
         for (fid, u), (size, name, perr) in zip(fetched, proofs):
             done.append((fid, u, size, name, perr))
         for fid, url, size, name, err in done:
