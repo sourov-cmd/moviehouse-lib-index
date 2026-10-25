@@ -1547,6 +1547,9 @@ def cmd_recheck(args):
     re-proven titles are re-pushed and the library API stops promising what cannot play.
     """
     conn = db()
+    # one-run diagnostic (2026-10-25): what do the stored r2 urls actually look like?
+    top = conn.execute("SELECT SUBSTR(url, 1, 40) p, COUNT(*) n FROM files WHERE host IN ('r2','r2zip') AND url IS NOT NULL GROUP BY p ORDER BY n DESC LIMIT 6").fetchall()
+    print(f"[recheck] url shapes: " + " | ".join(f"{r['p']}… {r['n']}" for r in top), flush=True)
     for h in DEAD_R2_PREFIXES:
         ids = [r[0] for r in conn.execute(
             "SELECT fid FROM files WHERE host IN ('r2','r2zip') AND url LIKE ? AND NOT (res_err='dead' AND resolved_at=0)",
