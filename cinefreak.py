@@ -1099,11 +1099,13 @@ def cmd_bresolve(args):
     # a file that failed in the browser (no buttons, relay error) waits 6 h before it is tried again: before 2026-10-15 the
     # same ~200 dead pages headed every round at 75 s each and the round never reached older files (the 18+ ones)
     rows = conn.execute(
-        "SELECT f.fid, f.quality, f.slug FROM files f LEFT JOIN titles t ON t.slug=f.slug "
+        "SELECT f.fid, f.quality, f.slug, f.res_err FROM files f LEFT JOIN titles t ON t.slug=f.slug "
         "WHERE (f.host='wall' OR (f.res_err IS NOT NULL AND f.res_err LIKE '%403%') "
         "OR (f.host='unknown' AND f.res_err IS NULL AND (length(f.fid) = 8 OR length(f.fid) >= 20))) "
         "AND NOT (f.res_err IS NOT NULL AND f.res_err NOT LIKE '%403%' AND COALESCE(f.resolved_at, 0) > ?) "
-        "ORDER BY (COALESCE(t.badges, '') LIKE '%Adult%') DESC, (f.res_err IS NULL) DESC, COALESCE(t.published, '') DESC, f.quality DESC LIMIT ?",
+        # 2026-10-25: the dead-link cohort (dead-bucket urls whose links died at the host, the user-visible
+        # playback emergency) goes FIRST; clean walls follow; adult titles keep their head-of-line place
+        "ORDER BY (COALESCE(t.badges, '') LIKE '%Adult%') DESC, (f.res_err='dead') DESC, (f.res_err IS NULL) DESC, COALESCE(t.published, '') DESC, f.quality DESC LIMIT ?",
         (int(time.time()) - 6 * 3600, args.limit)).fetchall()
     if not rows:
         print("[browser] nothing behind the wall", flush=True)
@@ -1174,6 +1176,11 @@ def cmd_bresolve(args):
                         elif not btns:
                             why = "moment" if "moment" in title.lower() else ("notfound" if "not found" in title.lower() or not title else "nobuttons")
                             out["host"], out["err"] = "wall", f"no buttons ({why})"
+                            # 2026-10-25: the page said the file is not there, and it said so before too (>=6h apart):
+                            # the file is gone from the site. Mark it terminally ('gone' is outside every queue) so
+                            # the round stops re-visiting it forever; the title re-crawl can revive it some day.
+                            if why in ("notfound", "nobuttons") and r["res_err"] and ("nobuttons" in r["res_err"] or "notfound" in r["res_err"]):
+                                out["host"], out["err"] = "gone", f"gone ({why} twice)"
                         if out["host"] == "r2":
                             out["bytes"], out["start_ms"] = await asyncio.to_thread(probe, out["url"])
                     except Exception as e:  # noqa: BLE001
@@ -1206,7 +1213,7 @@ def cmd_resolve(args):
     conn = db()
     rows = conn.execute(
         "SELECT f.fid, f.watch, f.url FROM files f LEFT JOIN titles t ON t.slug=f.slug "
-        "WHERE (length(f.fid) = 8 OR length(f.fid) >= 20) AND (f.resolved_at IS NULL OR (f.host IN ('unknown') AND f.resolved_at < ?) OR (f.res_err IS NOT NULL AND f.resolved_at < ?)) "
+        "WHERE (length(f.fid) = 8 OR length(f.fid) >= 20) AND f.host != 'gone' AND (f.resolved_at IS NULL OR (f.host IN ('unknown') AND f.resolved_at < ?) OR (f.res_err IS NOT NULL AND f.resolved_at < ?)) "
         "ORDER BY (f.res_err='dead' AND f.resolved_at=0) DESC, COALESCE(t.published, '') DESC, f.watch DESC, f.rowid DESC LIMIT ?",
         (int(time.time()) - 86400, int(time.time()) - 6 * 3600, args.limit)).fetchall()
     by = deadline_of("RESOLVE")
