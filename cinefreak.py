@@ -1205,9 +1205,9 @@ def cmd_bresolve(args):
 def cmd_resolve(args):
     conn = db()
     rows = conn.execute(
-        "SELECT f.fid, f.watch FROM files f LEFT JOIN titles t ON t.slug=f.slug "
+        "SELECT f.fid, f.watch, f.url FROM files f LEFT JOIN titles t ON t.slug=f.slug "
         "WHERE (length(f.fid) = 8 OR length(f.fid) >= 20) AND (f.resolved_at IS NULL OR (f.host IN ('unknown') AND f.resolved_at < ?) OR (f.res_err IS NOT NULL AND f.resolved_at < ?)) "
-        "ORDER BY COALESCE(t.published, '') DESC, f.watch DESC, f.rowid DESC LIMIT ?",
+        "ORDER BY (f.res_err='dead' AND f.resolved_at=0) DESC, COALESCE(t.published, '') DESC, f.watch DESC, f.rowid DESC LIMIT ?",
         (int(time.time()) - 86400, int(time.time()) - 6 * 3600, args.limit)).fetchall()
     by = deadline_of("RESOLVE")
     print(f"[resolve] {len(rows)} files", flush=True)
@@ -1222,7 +1222,9 @@ def cmd_resolve(args):
             now = int(time.time())
             for i in range(30):
                 try:
+                    was_dead = {(r["fid"]) for r in rows if r.get("url") and any(r["url"].startswith(h) for h in DEAD_R2_PREFIXES)}
                     conn.executemany("UPDATE files SET host='wall', url=NULL, resolved_at=?, res_err=NULL WHERE fid=?", [(now, r["fid"]) for r in rows])
+                    conn.executemany("UPDATE files SET res_err='dead' WHERE fid=?", [(f,) for f in was_dead])
                     conn.commit()
                     break
                 except sqlite3.OperationalError as e:
@@ -1518,6 +1520,13 @@ def cmd_skipcheck(args):
     print(f"[skip] checked {done}, spoken advert in {found}", flush=True)
 
 
+DEAD_R2_PREFIXES = [h.strip() for h in os.environ.get("LIB_DEAD_R2", "").split(",") if h.strip()]
+# measured 2026-10-25: pub-eb0dd3d4... (2,765 files) and pub-8b46bbc5... (1,425 files) answer 403
+# Forbidden (their r2.dev subdomain is gone); every other stored bucket answers 206.
+if not DEAD_R2_PREFIXES:
+    DEAD_R2_PREFIXES = ["https://pub-eb0dd3d4c4c84462bc3e3f1f8a3f", "https://pub-8b46bbc58f8c4eb084601251ab7c"]
+
+
 def cmd_recheck(args):
     """The stored direct links rot (owner, 2026-10-25).
     =============================================================================
@@ -1538,6 +1547,14 @@ def cmd_recheck(args):
     re-proven titles are re-pushed and the library API stops promising what cannot play.
     """
     conn = db()
+    for h in DEAD_R2_PREFIXES:
+        ids = [r[0] for r in conn.execute(
+            "SELECT fid FROM files WHERE host IN ('r2','r2zip') AND url LIKE ? AND NOT (res_err='dead' AND resolved_at=0)",
+            (h + "%",)).fetchall()]
+        if ids:
+            conn.executemany("UPDATE files SET resolved_at=0, res_err='dead' WHERE fid=?", [(i,) for i in ids])
+            conn.commit()
+            print(f"[recheck] {len(ids)} links on the dead host {h[:14]}... go to the head of the resolve queue", flush=True)
     rows = conn.execute(
         "SELECT f.fid, f.url FROM files f WHERE f.host IN ('r2','r2zip') AND f.url IS NOT NULL "
         "ORDER BY COALESCE(f.resolved_at, 0) ASC LIMIT ?", (args.limit,)).fetchall()
