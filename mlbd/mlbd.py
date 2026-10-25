@@ -52,7 +52,7 @@ ROW_FACTOR = float(os.environ.get("LIB_ROW_FACTOR", "4.0"))
 BASE_NUM = 2_100_000_000
 KINDS = ("movie", "series", "drama", "anime", "download18plus")  # 18+ posts carry badges "Adult"
 UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
-PACE = float(os.environ.get("MLBD_PACE", "0.3"))               # seconds between page requests (one tab)
+PACE = float(os.environ.get("MLBD_PACE", "0.2"))               # seconds between page requests (one tab)
 BATCH = int(os.environ.get("MLBD_BATCH", "4"))                 # pages fetched together
 
 
@@ -694,11 +694,14 @@ async def run(args) -> None:
                 await do_crawl(s, conn, args.limit)
                 await do_recheck(conn, args.limit)
                 by = deadline("RESOLVE")
+                # owner 2026-10-25: one round per run is far too slow — the recheck found 55,999 dead
+                # links (99% of the stored mlbd links die within hours). Keep resolving round after
+                # round until the run's time budget is spent; the round only bounds a single batch.
                 while time.time() < by - 60:
                     n = await do_resolve(s, conn, args.round)
                     if base and key and os.environ.get("MLBD_PUSH") == "1":
                         do_push(conn, base, key)
-                    if n < args.round:
+                    if n == 0:
                         break
         finally:
             conn.commit()
@@ -715,7 +718,7 @@ def main():
     k = sub.add_parser("recheck"); k.add_argument("--limit", type=int, default=100000)
     p = sub.add_parser("push"); p.add_argument("--base"); p.add_argument("--key")
     y = sub.add_parser("cycle"); y.add_argument("--listing", type=int, default=3); y.add_argument("--limit", type=int, default=100000)
-    y.add_argument("--round", type=int, default=300)
+    y.add_argument("--round", type=int, default=1500)
     sub.add_parser("stats")
     asyncio.run(run(ap.parse_args()))
 
