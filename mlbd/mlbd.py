@@ -585,7 +585,9 @@ async def do_recheck(conn, limit: int) -> int:
     async def one(r):
         return r["fid"], await asyncio.to_thread(alive_of, r["url"])
 
-    tasks = [one(r) for r in rows]
+    # real Tasks, not bare coroutines: the time-budget break calls t.cancel(), and a bare
+    # coroutine has no .cancel() (the 09:56 run crashed there on its first budget hit)
+    tasks = [asyncio.ensure_future(one(r)) for r in rows]
     try:
         for fut in asyncio.as_completed(tasks):
             if time.time() > by:
