@@ -87,19 +87,26 @@ ingest = [c for c in calls if c["path"] == "/ingest"]
 assert len(ingest) == 1 and len(ingest[0]["body"]["titles"]) == 1 and ingest[0]["body"]["titles"][0]["title"] == "T1", ingest
 print("a changed page still goes through the full ingest: ok")
 
-# 5) budget guard stops relink when the day's rows are spent
-conn.execute("INSERT INTO meta VALUES('rows:2099-01-01','99999')")
+# 5) relink keeps its own real-rows budget (the push estimate is ~1.5x the real D1 count and
+# must not starve the renewals): with a spent relink counter relink refuses, below it relinks.
+conn.execute("INSERT INTO meta VALUES('relinkrows:2099-01-01','99999')")
 conn.execute("UPDATE files SET pushed_url=NULL WHERE fid='f1'")
 conn.commit()
-# force the same day label by monkeypatching strftime is overkill; call with an exhausted budget directly
-spent_before = int(conn.execute("SELECT v FROM meta WHERE k='rows:%s'" % time.strftime("%Y-%m-%d", time.gmtime())).fetchone()[0])
-conn.execute("UPDATE meta SET v='99999' WHERE k='rows:%s'" % time.strftime("%Y-%m-%d", time.gmtime()))
+# force the same day label by monkeypatching strftime is overkill; exhaust the day's counter directly
+rl_before = int(conn.execute("SELECT v FROM meta WHERE k='relinkrows:%s'" % time.strftime("%Y-%m-%d", time.gmtime())).fetchone()[0])
+conn.execute("UPDATE meta SET v='99999' WHERE k='relinkrows:%s'" % time.strftime("%Y-%m-%d", time.gmtime()))
 conn.commit()
 calls.clear()
 mlbd.do_relink(conn, BASE, "k")
-assert not [c for c in calls if c["path"] == "/relink"], "budget exhausted but relink still called"
-conn.execute("UPDATE meta SET v=? WHERE k='rows:%s'" % time.strftime("%Y-%m-%d", time.gmtime()), (spent_before,))
+assert not [c for c in calls if c["path"] == "/relink"], "relink budget exhausted but relink still called"
+# a mostly-free relink budget relinks again (the shared push estimate is irrelevant here)
+conn.execute("UPDATE meta SET v='100' WHERE k='relinkrows:%s'" % time.strftime("%Y-%m-%d", time.gmtime()))
 conn.commit()
-print("the daily D1 write budget still guards relink: ok")
+calls.clear()
+n = mlbd.do_relink(conn, BASE, "k")
+assert n == 1 and any(c["path"] == "/relink" for c in calls), (n, calls)
+conn.execute("UPDATE meta SET v=? WHERE k='relinkrows:%s'" % time.strftime("%Y-%m-%d", time.gmtime()), (rl_before,))
+conn.commit()
+print("relink keeps its own real-rows budget and still relinks under the push estimate: ok")
 
 print("PASS test_relink.py")
