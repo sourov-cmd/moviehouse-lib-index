@@ -1588,6 +1588,10 @@ def cmd_recheck(args):
     # one-run diagnostic (2026-10-25): what do the stored r2 urls actually look like?
     top = conn.execute("SELECT SUBSTR(url, 1, 40) p, COUNT(*) n FROM files WHERE host IN ('r2','r2zip') AND url IS NOT NULL GROUP BY p ORDER BY n DESC LIMIT 6").fetchall()
     print(f"[recheck] url shapes: " + " | ".join(f"{r['p']}… {r['n']}" for r in top), flush=True)
+    # the dead-bucket cohort, counted straight (no res_err filter) — settles whether the crawler still holds them
+    for h in ("https://pub-eb0dd3d4c4c84462bc3e3f1f8a3f1b61", "https://pub-8b46bbc58f8c4eb084601251ab7c7f58"):
+        row = conn.execute("SELECT COUNT(*) n, SUM(CASE WHEN res_err='dead' AND resolved_at=0 THEN 1 ELSE 0 END) deadmarked, MIN(resolved_at) mn, MAX(resolved_at) mx FROM files WHERE host IN ('r2','r2zip') AND url LIKE ?", (h + "%",)).fetchone()
+        print(f"[recheck] cohort {h[12:26]}…: rows {row['n']} deadmarked {row['deadmarked']} resolved {row['mn']}..{row['mx']}", flush=True)
     for h in DEAD_R2_PREFIXES:
         ids = [r[0] for r in conn.execute(
             "SELECT fid FROM files WHERE host IN ('r2','r2zip') AND url LIKE ? AND NOT (res_err='dead' AND resolved_at=0)",
