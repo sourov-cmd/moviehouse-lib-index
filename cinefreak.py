@@ -1591,12 +1591,14 @@ def cmd_cycle(args):
     cmd_skipcheck(args)
     cmd_recheck(args)
     by = deadline_of("RESOLVE")
+    # owner 2026-10-25: don't stop at the first short round — keep resolving until the
+    # run's time budget is spent (the recheck keeps surfacing dead links as it rotates).
     while time.time() < by - 60:
         args.limit = args.round
         n = cmd_resolve(args)
         args.limit = 100000
         cmd_push(args)
-        if n < args.round:
+        if n == 0:
             break
     # 2026-10-14: files behind the Turnstile wall go through the browser (LIB_BROWSER_TABS tabs), in rounds of LIB_BROWSER_ROUND files,
     # each round pushed at once (a run that is stopped keeps what it found)
