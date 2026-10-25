@@ -66,7 +66,8 @@ jobs:
           M="${{ inputs.minutes }}"; L="${{ inputs.listing }}"; M="${M:-85}"; L="${L:-3}"
           now=$(date +%s)
           export MLBD_CRAWL_BY=$((now + M*60*2/5)) MLBD_RESOLVE_BY=$((now + M*60))
-          export LIB_RECHECK_SECONDS=120
+          export LIB_RECHECK_SECONDS=600
+          export LIB_DAILY_ROWS=58000
           if [ "$TEST" = "1" ]; then
             export MLBD_CRAWL_BY=$((now + 15*60)) MLBD_RESOLVE_BY=$((now + 40*60))
             xvfb-run -a python3 mlbd/mlbd.py cycle --listing 2 --limit 200 --round 250 2>&1 | grep -v -E "ERROR|inotify|dbus" || true
