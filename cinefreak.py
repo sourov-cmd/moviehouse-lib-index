@@ -185,6 +185,12 @@ def db() -> sqlite3.Connection:
         # NULL = not checked yet; 0 = no spoken advert; >0 = where the film begins (see voice_start)
         c.execute("ALTER TABLE files ADD COLUMN start_ms INTEGER")
         c.commit()
+    if "checked_at" not in [r[1] for r in c.execute("PRAGMA table_info(files)")]:
+        # when the link was last proven alive. Kept apart from resolved_at on purpose: resolved_at is part of a
+        # title's push hash, so renewing it on every recheck re-pushed the whole index (see cmd_recheck).
+        c.execute("ALTER TABLE files ADD COLUMN checked_at INTEGER")
+        c.execute("UPDATE files SET checked_at = resolved_at WHERE checked_at IS NULL")
+        c.commit()
     return c
 
 
@@ -1497,7 +1503,15 @@ def cmd_push(args):
                     raise
                 time.sleep(5 * (i + 1))
         if not res.get("ok"):
-            raise RuntimeError(f"ingest: {str(res)[:300]}")
+            # The worker answers ok:false when ANY title in the batch failed, and it still writes the rest. Before
+            # 2026-10-30 this raised and threw the whole batch away, so one bad title blocked every title behind it
+            # and the run died with a bare "ingest: {...}" that named no slug. Now the failures are named, the
+            # titles that did land are recorded, and only a batch where nothing at all was written is fatal.
+            errs = res.get("errors") or []
+            print(f"[push] ingest reported {len(errs)} failed title(s): "
+                  + "; ".join(f"{e.get('slug')}: {e.get('error')}" for e in errs[:5]), flush=True)
+            if not res.get("written") and not res.get("changed"):
+                raise RuntimeError(f"ingest wrote nothing: {str(res)[:300]}")
         for p, cost in batch:
             mx = conn.execute("SELECT COALESCE(MAX(resolved_at),0) FROM files WHERE slug=?", (p["slug"],)).fetchone()[0]
             write_retry(conn, "UPDATE titles SET pushed_hash=? WHERE slug=?", (f"{p['_base_hash']}:{mx}", p["slug"]))
@@ -1600,9 +1614,11 @@ def cmd_recheck(args):
             conn.executemany("UPDATE files SET resolved_at=0, res_err='dead' WHERE fid=?", [(i,) for i in ids])
             conn.commit()
             print(f"[recheck] {len(ids)} links on the dead host {h[:14]}... go to the head of the resolve queue", flush=True)
+    # Rotate on checked_at, not resolved_at: resolved_at feeds the push hash, so renewing it here made every
+    # re-proven title look changed and re-pushed ~1,900 titles an hour (written=0, D1 rows burned for nothing).
     rows = conn.execute(
         "SELECT f.fid, f.url FROM files f WHERE f.host IN ('r2','r2zip') AND f.url IS NOT NULL "
-        "ORDER BY COALESCE(f.resolved_at, 0) ASC LIMIT ?", (args.limit,)).fetchall()
+        "ORDER BY COALESCE(f.checked_at, f.resolved_at, 0) ASC LIMIT ?", (args.limit,)).fetchall()
     by = min(deadline_of("RESOLVE"), time.time() + float(os.environ.get("LIB_RECHECK_SECONDS", "240")))
     print(f"[recheck] {len(rows)} stored links, oldest resolved first", flush=True)
     alive = dead = 0
@@ -1613,7 +1629,7 @@ def cmd_recheck(args):
         nonlocal pending
         for i in range(30):
             try:
-                conn.executemany("UPDATE files SET resolved_at=?, res_err=? WHERE fid=?", pending)
+                conn.executemany("UPDATE files SET checked_at=?, res_err=? WHERE fid=?", pending)
                 conn.commit()
                 break
             except sqlite3.OperationalError as e:
@@ -1632,7 +1648,7 @@ def cmd_recheck(args):
             fid = futs[fut]
             if fut.result() is not None:
                 alive += 1
-                pending.append((int(time.time()), None, fid))   # res_err cleared: proven again now
+                pending.append((int(time.time()), None, fid))   # res_err cleared: proven again now (checked_at only)
             else:
                 dead += 1
                 pending.append((0, "dead", fid))                # resolved_at=0 + res_err: resolve re-picks it this run
