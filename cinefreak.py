@@ -1511,7 +1511,14 @@ def cmd_push(args):
             print(f"[push] ingest reported {len(errs)} failed title(s): "
                   + "; ".join(f"{e.get('slug')}: {e.get('error')}" for e in errs[:5]), flush=True)
             if not res.get("written") and not res.get("changed"):
-                raise RuntimeError(f"ingest wrote nothing: {str(res)[:300]}")
+                # 2026-10-30: this used to raise, which killed the whole cycle (and the state save with it) over
+                # a handful of titles. The 19:31 run died here on 7 titles and printed no reason at all, because
+                # the worker's own reply was never shown. Print the reply, skip these titles for this run, and
+                # let the rest of the cycle finish; they stay unpushed and are retried next run.
+                print(f"[push] ingest wrote nothing for this batch; worker said: {str(res)[:400]}", flush=True)
+                print(f"[push] skipping {len(batch)} title(s) this run; they stay queued for the next one", flush=True)
+                batch = []
+                return
         for p, cost in batch:
             mx = conn.execute("SELECT COALESCE(MAX(resolved_at),0) FROM files WHERE slug=?", (p["slug"],)).fetchone()[0]
             write_retry(conn, "UPDATE titles SET pushed_hash=? WHERE slug=?", (f"{p['_base_hash']}:{mx}", p["slug"]))
