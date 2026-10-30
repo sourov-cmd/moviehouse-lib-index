@@ -128,17 +128,11 @@ jobs:
       - name: Next run in an hour (the schedule alone is not reliable)
         if: ${{ !cancelled() && vars.LIB_SYNC_CHAIN == '1' }}
         run: |
-          # Never sooner than 55 minutes after this run began (the hourly pace), and only when no other sync run waits.
-          # 2026-10-12: GitHub's hourly schedule fired only every 3-8 hours (01:22 -> 09:17 UTC on 12 Oct), and the old
-          # "a schedule fired in the last 3 hours" test then stood down, so new posts waited up to 8 hours. Every run
-          # now starts the next one unless another is already waiting; the schedule stays as a second starter.
-          others=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/sync.yml/runs?per_page=20" --jq "[.workflow_runs[] | select(.id != ${{ github.run_id }}) | select(.status==\"queued\" or .status==\"in_progress\" or .status==\"pending\")] | length")
-          if [ "${others:-0}" -gt 0 ]; then echo "another run is waiting; nothing to do"; exit 0; fi
-          start=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/${{ github.run_id }}" --jq .run_started_at)
-          wait=$(( $(date -d "$start" +%s) + 55*60 - $(date +%s) ))
-          [ "$wait" -gt 0 ] && sleep "$wait"
-          others=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/sync.yml/runs?per_page=20" --jq "[.workflow_runs[] | select(.id != ${{ github.run_id }}) | select(.status==\"queued\" or .status==\"in_progress\" or .status==\"pending\")] | length")
-          if [ "${others:-0}" -gt 0 ]; then echo "the schedule started one meanwhile; nothing to do"; exit 0; fi
-          gh workflow run sync.yml --repo "$GITHUB_REPOSITORY" --ref main
-          echo "next run started"
+          # 2026-10-30: this step used to sleep here, inside the job that holds the `lib-sync` concurrency lock.
+          # A run that finished its crawl at 18:20 then sat "in_progress" until 19:12 doing nothing, and every
+          # other sync run queued behind it — two runs were stuck for 40+ minutes on 30 Oct while the queue grew.
+          # The wait now lives in chain.yml, which has its own concurrency group, so this job ends as soon as the
+          # crawl does and the lock is released.
+          gh workflow run chain.yml --repo "$GITHUB_REPOSITORY" --ref main
+          echo "chain.yml started; it will pace the next sync"
 

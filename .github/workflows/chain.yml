@@ -1,0 +1,57 @@
+name: Library sync chain
+
+# Paces the next Library sync run. Split out of sync.yml on 2026-10-30.
+#
+# Why: sync.yml holds the `lib-sync` concurrency lock for its whole job. The old "Next run in an hour"
+# step slept up to 55 minutes inside that job, so a run that had already finished crawling kept the
+# lock and every other sync run queued behind it. On 30 Oct two runs sat in_progress for 40+ minutes
+# with nothing to do, and the run that actually carried a fix could not start.
+#
+# This workflow does the waiting instead. It has its own concurrency group, so it never blocks a sync,
+# and it starts the next sync only when no other sync run is queued or running.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: lib-sync-chain
+  cancel-in-progress: false
+
+jobs:
+  chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Wait for the hourly pace, then start the next sync
+        run: |
+          set -euo pipefail
+          # Never sooner than 55 minutes after the sync that spawned us began, and only when no other sync
+          # run is waiting. The schedule in sync.yml stays as a second starter.
+          others=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/sync.yml/runs?per_page=20" \
+            --jq '[.workflow_runs[] | select(.status=="queued" or .status=="in_progress" or .status=="pending")] | length')
+          if [ "${others:-0}" -gt 0 ]; then
+            echo "another sync run is waiting; nothing to do"
+            exit 0
+          fi
+
+          # The sync run that dispatched us is the newest one; pace from its start time.
+          start=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/sync.yml/runs?per_page=1" --jq '.workflow_runs[0].run_started_at')
+          wait=$(( $(date -d "$start" +%s) + 55*60 - $(date +%s) ))
+          if [ "$wait" -gt 0 ]; then
+            echo "waiting ${wait}s so the next sync starts 55 min after the last one began"
+            sleep "$wait"
+          fi
+
+          others=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/sync.yml/runs?per_page=20" \
+            --jq '[.workflow_runs[] | select(.status=="queued" or .status=="in_progress" or .status=="pending")] | length')
+          if [ "${others:-0}" -gt 0 ]; then
+            echo "the schedule started one meanwhile; nothing to do"
+            exit 0
+          fi
+
+          gh workflow run sync.yml --repo "$GITHUB_REPOSITORY" --ref main
+          echo "next sync started"
