@@ -116,8 +116,21 @@ def _attrs(tag: str) -> dict:
     return {k: unescape(v) for k, v in re.findall(r'([\w-]+)="([^"]*)"', tag)}
 
 
+ENTITY = re.compile(r"&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z]+);")
+
+
+def _unent(s: str | None) -> str | None:
+    """The site sometimes escapes twice ("It&amp;#39;s" in the page): unescape until no entity is left (at most 3 rounds).
+    45 older titles reached the Library as "It&#39;s Okay..." / "Ki &amp; Ka" (measured on D1, 2026-10-31)."""
+    for _ in range(3):
+        if not s or not ENTITY.search(s):
+            break
+        s = unescape(s)
+    return s
+
+
 def _text(s: str) -> str:
-    return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", s or ""))).strip()
+    return re.sub(r"\s+", " ", _unent(re.sub(r"<[^>]+>", " ", s or ""))).strip()
 
 
 def _size_mb(label: str) -> float | None:
@@ -667,8 +680,8 @@ def payload(conn, path: str) -> dict:
         kind = "movie"
     mx = max([f["bytes"] or 0 for f in files] + [0])
     return {
-        "num": BASE_NUM + int(t["cid"]), "slug": "mlbd-" + path.strip("/").replace("/", "-"), "type": kind, "title": t["title"], "aka": t["aka"],
-        "year": t["year"], "poster": poster, "overview": t["overview"], "genres": t["genres"], "language": t["language"],
+        "num": BASE_NUM + int(t["cid"]), "slug": "mlbd-" + path.strip("/").replace("/", "-"), "type": kind, "title": _unent(t["title"]), "aka": _unent(t["aka"]),
+        "year": t["year"], "poster": poster, "overview": _unent(t["overview"]), "genres": t["genres"], "language": t["language"],
         "country": None, "rating": t["rating"], "releaseDate": None, "runtime": None, "tmdbId": None, "imdbId": None, "status": t["status"],
         "cats": ",".join(x for x in (t["kind"].title() if t["kind"] else None, t["language"]) if x), "ott": None, "badges": "Adult" if path.startswith("/download18plus/") else None,
         "published": None, "modified": None, "hash": f"{t['hash']}:{mx}" + (":m" if as_film else ""), "episodes": eps, "files": files,
