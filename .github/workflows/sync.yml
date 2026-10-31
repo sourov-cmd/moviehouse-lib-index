@@ -52,14 +52,16 @@ jobs:
       LIB_ROUND: ${{ inputs.round || '1500' }}
       # 2026-10-14: the file host shows Turnstile to plain requests; new files go through a real browser (3 tabs,
       # rounds of 300, each round pushed). D1 writes on the Library account: this source 45k/day, movielinkbd 40k/day,
-      # 15k left for the shelf flags and the app (free plan: 100k/day).
+      # 15k left for the shelf flags and the app (was the free plan's 100k/day until the 2026-10-31 move to the paid account).
       LIB_BROWSER: "1"
       LIB_BROWSER_ROUND: "300"
       LIB_BROWSER_TABS: "5"
       LIB_PROXY_SERVER: "http://${{ secrets.BD_PROXY_SERVER }}"
       LIB_PROXY_USER: ${{ secrets.BD_PROXY_USER }}
       LIB_PROXY_PASS: ${{ secrets.BD_PROXY_PASS }}
-      LIB_DAILY_ROWS: "45000"
+      # 2026-10-31: the Library moved to snrgngbd (Workers Paid: 50M D1 rows written/month included), so the
+      # free-plan share (45k/day) is lifted.
+      LIB_DAILY_ROWS: "400000"
       LIB_QUIET: "1"
       # A second egress lane (owner's Bright Data proxy, 2026-10-11): the source allows ~2 requests/s per IP,
       # so two lanes resolve about twice as fast. Empty secret = direct line only, exactly as before.
