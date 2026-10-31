@@ -7,7 +7,7 @@ name: Library sync (movielinkbd)
 # A push to the viktor/mlbd branch is a TEST: a fresh index, a small sample, nothing pushed, nothing saved.
 # Production (2026-10-14, owner's approval): a run every hour reads what is new; while the first full pass is not
 # finished each run also works through the backlog. Repository variable LIB_MLBD_CHAIN=1 makes every run start the
-# next one (GitHub's hourly schedule alone fires only every 3-8 hours). D1 writes stay under LIB_DAILY_ROWS (40k/day).
+# next one (GitHub's hourly schedule alone fires only every 3-8 hours). D1 writes stay under LIB_DAILY_ROWS (400k/day since the 2026-10-31 move to the paid account).
 on:
   schedule:
     - cron: "23 * * * *"
@@ -67,7 +67,9 @@ jobs:
           now=$(date +%s)
           export MLBD_CRAWL_BY=$((now + M*60*2/5)) MLBD_RESOLVE_BY=$((now + M*60))
           export LIB_RECHECK_SECONDS=600
-          export LIB_DAILY_ROWS=58000
+          # 2026-10-31: Library on snrgngbd's paid plan — the free-plan caps are lifted so dead links are renewed the
+          # same day and the backlog lands quickly.
+          export LIB_DAILY_ROWS=400000 LIB_RELINK_ROWS=200000 LIB_RELINK_RESERVE=100000
           if [ "$TEST" = "1" ]; then
             export MLBD_CRAWL_BY=$((now + 15*60)) MLBD_RESOLVE_BY=$((now + 40*60))
             xvfb-run -a python3 mlbd/mlbd.py cycle --listing 2 --limit 200 --round 250 2>&1 | grep -v -E "ERROR|inotify|dbus" || true
