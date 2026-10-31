@@ -304,6 +304,23 @@ async def do_index(s, conn, shards: bool, listing: int) -> None:
         unknown += new_here
         if pg > 2 and not new_here and listing < 50:   # a delta walk stops at the first page it fully knows
             break
+    # 3b. the 18+ listing (Viktor, 2026-10-31): the sitemaps name only 75 of its ~310 posts (measured: /adult18plus
+    #     pages 1-11 = 311 cards, 295 posters; sitemaps 75), so the rest never reached the index. Same cards, same
+    #     poster-keyed delta: the first walk reads every page, later walks stop at the first page they fully know.
+    full18 = not conn.execute("SELECT 1 FROM items WHERE kind='download18plus' AND card_poster IS NOT NULL LIMIT 1").fetchone()
+    seen = {p for _, p in unknown}
+    for pg in range(1, 40):
+        st, x, _ = await s.get("/adult18plus" if pg == 1 else f"/adult18plus/page/{pg}", PACE)
+        if st != 200:
+            break
+        cards = re.findall(r'<a data-mlbd-click-ad="movie-card" href="(/(?:movie|series|drama|anime|download18plus)/[^"]+)">\s*<img[^>]*data-src="([^"]+)"', x)
+        if not cards:
+            break
+        new_here = [(href, poster) for href, poster in cards if poster not in seen and not conn.execute("SELECT 1 FROM items WHERE card_poster=?", (poster,)).fetchone()]
+        seen.update(p for _, p in new_here)
+        unknown += new_here
+        if not full18 and pg > 1 and not new_here:
+            break
     for i in range(0, len(unknown), BATCH):
         part = unknown[i:i + BATCH]
         res = await s.get_many([u for u, _ in part], PACE)
