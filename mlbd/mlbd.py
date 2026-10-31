@@ -435,6 +435,21 @@ FRESH: dict[str, float] = {}
 FRESH_S = int(os.environ.get("MLBD_FRESH_S", "600"))
 
 
+def resend_relinked_once(conn) -> None:
+    """One-time (Viktor, 2026-10-31): the 410 sweep parked 20,471 expired links in the Library as host='dead', and the
+    Library's /relink then only touched host='r2' rows, so renewed links never reached them (the 00:39 run sent 2,813
+    and 11 rows changed). The worker now revives a 'dead' row with its renewed link; send again every link this
+    crawler has proven alive in the last 20 h (fresh resolve or recheck, res_err NULL). A link it found dead keeps
+    its pushed_url, so no dead link is sent."""
+    if conn.execute("SELECT v FROM meta WHERE k='relink_dead_20261031'").fetchone():
+        return
+    n = conn.execute("UPDATE files SET pushed_url=NULL WHERE host='r2' AND url IS NOT NULL AND res_err IS NULL "
+                     "AND resolved_at > ?", (int(time.time()) - 20 * 3600,)).rowcount
+    meta_set(conn, "relink_dead_20261031", str(n))
+    conn.commit()
+    print(f"[reset] {n} living links will be sent to the Library again", flush=True)
+
+
 def resend_filmlike_once(conn) -> None:
     """One-time (2026-10-15): series-typed posts whose files carry no season were sent as "tv" and could not play; send
     them again (payload() now sends them as films)."""
@@ -661,7 +676,7 @@ def do_relink(conn, base: str, key: str) -> int:
     rows = conn.execute(
         "SELECT f.fid, f.url FROM files f JOIN titles t ON t.path=f.path "
         "WHERE f.host='r2' AND f.url IS NOT NULL AND (f.pushed_url IS NULL OR f.pushed_url IS NOT f.url) "
-        "AND t.pushed_hash IS NOT NULL ORDER BY f.rowid LIMIT 3000").fetchall()
+        "AND t.pushed_hash IS NOT NULL ORDER BY f.rowid LIMIT 8000").fetchall()
     if not rows:
         return 0
     sent = 0
@@ -797,6 +812,7 @@ async def run(args) -> None:
         try:
             reset_stale_once(conn)
             resend_filmlike_once(conn)
+            resend_relinked_once(conn)
             if args.cmd in ("index", "cycle"):
                 await do_index(s, conn, getattr(args, "shards", False) or not conn.execute("SELECT 1 FROM items LIMIT 1").fetchone(), args.listing)
             if args.cmd == "crawl":
