@@ -291,7 +291,12 @@ def max_page(html: str) -> int:
 # 2026-10-14: the host's file codes grew from 8 lowercase characters to ~62 mixed-case ones ('utrZO3Qk...-T_g0...').
 # The old [a-z0-9]+ cut them at the first capital ('utr', '2', 'x'): files got wrong codes that collide across titles
 # (2,309 such rows in the Library, every one unplayable), and their /f/ pages could not open.
-_FID = re.compile(r"cinecloud\.site/([fxwd])/([A-Za-z0-9_-]+)")
+# 2026-10-31 (Viktor): the title pages now link the file host as cinecloud.top (new5.cinecloud.site answers a full
+# Cloudflare challenge, "Just a moment", 403 to every plain request). The old pattern only matched "cinecloud.site", so
+# from ~24 Oct every new title came in with NO files — the reason no new cinefreak title reached the app. Any
+# cinecloud.<tld> host is accepted now, and the file host is one setting (LIB_FILE_HOST).
+_FID = re.compile(r"cinecloud\.(?:site|top|[a-z]{2,10})/([fxwd])/([A-Za-z0-9_-]+)")
+FILE_HOST = os.environ.get("LIB_FILE_HOST", "https://cinecloud.top").rstrip("/")
 
 
 def _hidden(el) -> bool:
@@ -906,7 +911,7 @@ def cmd_crawl(args):
 def resolve_one(fid: str, watch: int) -> tuple[str, dict]:
     out = {"host": None, "url": None, "sub_url": None, "bytes": None, "err": None, "start_ms": None}
     try:
-        page_html = fetch(f"https://new5.cinecloud.site/f/{fid}", tries=2)
+        page_html = fetch(f"{FILE_HOST}/f/{fid}", tries=2)
         # 2026-10-25: the site itself answers its real page when the code is known (a healthy code answers
         # plain, probed) and 'File not Found' when the code is dead/rotated. The dead buckets' old codes all
         # answer not found (10/10 probed) — chase the title, not the code.
@@ -919,12 +924,12 @@ def resolve_one(fid: str, watch: int) -> tuple[str, dict]:
             # A Drive copy: '/w/<fid>' names a fresh googleusercontent link (works from any network, no
             # ranges) for the newer uploads; the oldest point at a Drive id that is gone. Only the class is
             # kept: the gateway asks /w/ again at play time, because the link is signed and short-lived.
-            w = fetch(f"https://new5.cinecloud.site/w/{fid}")
+            w = fetch(f"{FILE_HOST}/w/{fid}")
             out["host"] = "gu" if "video-downloads.googleusercontent.com" in w else ("gdid" if "download.aspx?id=" in w else "gd")
             return fid, out
         if watch:
             try:
-                w = parse_watch_page(fetch(f"https://new5.cinecloud.site/x/{fid}"))
+                w = parse_watch_page(fetch(f"{FILE_HOST}/x/{fid}"))
                 out["sub_url"] = w.get("sub_url")
                 if not out["url"] and w.get("url"):
                     out["url"], out["host"] = w["url"], "r2"
@@ -957,7 +962,7 @@ def resolve_one(fid: str, watch: int) -> tuple[str, dict]:
 # exactly as the old resolve kept it. 480p files and the newest series episodes carry only "FAST CLOUD [V2]" (a
 # vidzer ticket bound to the browser, expires in 6 h) or a Drive copy: nothing permanent, so they are kept as 'v2'
 # or 'gd' and never offered for play. Pages are opened one after another (one tab): the host is never hammered.
-BR_HOST = "https://new5.cinecloud.site"
+BR_HOST = FILE_HOST
 BR_ADS = re.compile(r"profitableratecpm|llvpn\.com|ay267\.com|googletagmanager|google-analytics|cloudflareinsights")
 
 
