@@ -511,6 +511,17 @@ async def do_resolve(s, conn, limit: int) -> int:
         "SELECT f.fid, f.path, f.aurl FROM files f JOIN items i ON i.path=f.path WHERE f.aurl IS NOT NULL AND "
         "(f.resolved_at IS NULL OR (f.res_err IS NOT NULL AND f.res_err NOT LIKE 'archive%' AND f.resolved_at < ?)) "
         "ORDER BY COALESCE(i.lastmod,'') DESC, f.quality=720 DESC, f.quality DESC LIMIT ?", (int(time.time()) - 86400, limit)).fetchall()
+    # Viktor 2026-11-03: posts found only on the /adult18plus listing carry no sitemap lastmod, so COALESCE(lastmod,'')
+    # sorted them last and the 1,500-file round (always full of link renewals) never reached them: 292 18+ posts were
+    # indexed on 31 Oct but only 76 reached the Library by 3 Nov. A fifth of every round now goes to files that were
+    # never resolved at all (18+ first), so new posts always move, whatever the renewal backlog.
+    fresh = conn.execute(
+        "SELECT f.fid, f.path, f.aurl FROM files f JOIN items i ON i.path=f.path WHERE f.aurl IS NOT NULL AND f.resolved_at IS NULL "
+        "ORDER BY i.kind='download18plus' DESC, COALESCE(i.lastmod,'') DESC, f.quality=720 DESC, f.quality DESC LIMIT ?",
+        (max(1, limit // 5),)).fetchall()
+    if fresh:
+        have = {r["fid"] for r in fresh}
+        rows = sorted(fresh, key=lambda r: r["path"]) + [r for r in rows if r["fid"] not in have][: max(0, limit - len(fresh))]
     only = os.environ.get("MLBD_ONLY")   # a test resolves just the kind it read
     if only:
         rows = conn.execute("SELECT fid, path, aurl FROM files WHERE aurl IS NOT NULL AND resolved_at IS NULL AND path LIKE ? LIMIT ?", (only + "%", limit)).fetchall()
