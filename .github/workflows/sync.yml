@@ -11,9 +11,12 @@ name: Library sync
 # redirects every direct request, so an hourly run spent ~55 minutes to find 1 new file. One daily run keeps the
 # index honest and shows the day the source opens again (new files found > 0); then set the repository variable
 # LIB_SYNC_CHAIN=1 to go back to a run every hour.
+# 2026-11-03 (Viktor): the hourly chain died on 2 Nov 14:24 UTC when GitHub answered HTTP 500 to one
+# `gh workflow run chain.yml`, and the daily 03:17 schedule did not fire either, so nothing ran for 17 h.
+# The dispatch now retries, and a schedule every 3 hours is the backstop (the concurrency group queues overlaps).
 on:
   schedule:
-    - cron: "17 3 * * *"
+    - cron: "17 */3 * * *"
   workflow_dispatch:
     inputs:
       minutes:
@@ -135,6 +138,11 @@ jobs:
           # other sync run queued behind it — two runs were stuck for 40+ minutes on 30 Oct while the queue grew.
           # The wait now lives in chain.yml, which has its own concurrency group, so this job ends as soon as the
           # crawl does and the lock is released.
-          gh workflow run chain.yml --repo "$GITHUB_REPOSITORY" --ref main
-          echo "chain.yml started; it will pace the next sync"
+          for i in 1 2 3 4 5 6; do
+            if gh workflow run chain.yml --repo "$GITHUB_REPOSITORY" --ref main; then
+              echo "chain.yml started; it will pace the next sync"; exit 0
+            fi
+            echo "dispatch failed (try $i), retrying in $((i*20)) s"; sleep $((i*20))
+          done
+          echo "::warning::chain dispatch failed 6 times; the 3-hourly schedule will start the next run"
 
