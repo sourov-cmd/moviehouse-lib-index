@@ -36,6 +36,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.request
@@ -93,6 +94,13 @@ def db() -> sqlite3.Connection:
     c.executescript(SCHEMA)
     try:  # 2026-10-25: what the Library worker already holds for this file (relink sends only the difference)
         c.execute("ALTER TABLE files ADD COLUMN pushed_url TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:  # 2026-11-06: where the film begins past the spoken advert (see voice_start);
+        # NULL = not checked yet, 0 = no advert, >0 = the offset the player starts at.
+        # The first source has carried this since its own advert was measured; this
+        # source never did, so its "Downloaded by Movielinkbd" voice played in full.
+        c.execute("ALTER TABLE files ADD COLUMN start_ms INTEGER")
     except sqlite3.OperationalError:
         pass
     return c
@@ -423,6 +431,70 @@ async def do_crawl(s, conn, limit: int) -> int:
 
 # ---------------------------------------------------------------- resolve
 
+# -----------------------------------------------------------------------------
+# THE SPOKEN ADVERT AT THE START OF THE FILE (2026-11-06)
+# -----------------------------------------------------------------------------
+# The first source cuts its spoken "downloaded by" advert out of playback by
+# measuring where it ends (cinefreak.py voice_start): the player is handed a
+# start offset (start_ms, a column the Library worker already stores and serves
+# for every file), so the film simply begins past the voice. This source never
+# measured it, so its own advert - the "Downloaded by Movielinkbd" voice the
+# owner reported - played in full on every one of its files.
+#
+# The method is cinefreak's, unchanged: the first seconds of audio are matched
+# against a short reference recording of the advert (spectrogram correlation,
+# 0.5 decides), and the film is taken to start 0.2 s after the recording ends.
+# The reference for THIS source lives beside this file as mlbd_ad_ref.raw
+# (8 kHz mono s16le, cut from a confirmed movielinkbd file's own advert, the
+# way ad_ref.raw was cut for the first source). Until that file exists the
+# probe answers None - "not checked" - and nothing about playback changes:
+# a detector without its reference must never guess an offset.
+AD_REF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mlbd_ad_ref.raw")
+AD_SR, AD_HOP, AD_N, AD_MATCH = 8000, 80, 256, 0.5
+_AD = None
+
+
+def _spec(a):
+    import numpy as np
+    frames = np.lib.stride_tricks.sliding_window_view(a, AD_N)[::AD_HOP] * np.hanning(AD_N)
+    s = np.log(np.abs(np.fft.rfft(frames, axis=1))[:, 4:100] + 1e-6)   # ~125 Hz to 3.1 kHz: the voice
+    return s - s.mean(1, keepdims=True)
+
+
+def voice_start(url: str) -> int | None:
+    """Where the film begins past the spoken advert, in ms; 0 when there is none; None when it could not be read."""
+    global _AD
+    try:
+        import numpy as np
+        if _AD is None:
+            ref = np.frombuffer(open(AD_REF, "rb").read(), dtype="<i2").astype(np.float32) / 32768
+            r = _spec(ref)
+            _AD = (r - r.mean()) / r.std()
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Range": "bytes=0-3000000"})
+        with urllib.request.urlopen(req, timeout=40) as resp:
+            head = resp.read(3_000_001)
+        p = subprocess.run(["ffmpeg", "-v", "error", "-i", "pipe:0", "-t", "9", "-map", "0:a:0", "-vn", "-ac", "1", "-ar", str(AD_SR), "-f", "s16le", "pipe:1"],
+                           input=head, capture_output=True, timeout=60)
+        pcm = p.stdout[: len(p.stdout) // 2 * 2]
+        if len(pcm) < AD_SR * 2 * 4:
+            return None
+        a = _spec(np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768)
+        L = len(_AD)
+        if len(a) <= L:
+            return None
+        corr = np.empty(len(a) - L)
+        for k in range(len(corr)):                     # normalised correlation at every 10 ms offset
+            x = a[k:k + L]
+            corr[k] = float(((x - x.mean()) * _AD).mean() / (x.std() + 1e-9))
+        i = int(corr.argmax())
+        if corr[i] < AD_MATCH:
+            return 0
+        # the recording's own length past where it starts, plus 0.2 s of quiet
+        return int(round((i * AD_HOP / AD_SR + L * AD_HOP / AD_SR + 0.2) * 1000))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def check_direct(url: str) -> tuple[int | None, str | None, str | None]:
     """(bytes, filename, error): one ranged GET, as the gateway proves a file before play."""
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Range": "bytes=0-1023"})
@@ -540,12 +612,12 @@ async def do_resolve(s, conn, limit: int) -> int:
         else:
             groups.append([r])
 
-    def mark(fid: str, url, size, name, err):
+    def mark(fid: str, url, size, name, err, start=None):
         host = "r2" if url and not err else None
         key = "ok" if host else " ".join((err or "?").split(" ")[:2])
         stat[key] = stat.get(key, 0) + 1
-        conn.execute("UPDATE files SET host=?, url=?, bytes=?, fname=?, resolved_at=?, res_err=? WHERE fid=?",
-                     (host, url if host else None, size, name, int(time.time()), err, fid))
+        conn.execute("UPDATE files SET host=?, url=?, bytes=?, fname=?, resolved_at=?, res_err=?, start_ms=COALESCE(?, start_ms) WHERE fid=?",
+                     (host, url if host else None, size, name, int(time.time()), err, start, fid))
 
     for g in groups:
         if time.time() > by:
@@ -603,7 +675,14 @@ async def do_resolve(s, conn, limit: int) -> int:
         for (fid, u), (size, name, perr) in zip(fetched, proofs):
             done.append((fid, u, size, name, perr))
         for fid, url, size, name, err in done:
-            mark(fid, url, size, name, err)
+            start = None
+            if url and not err:
+                row = conn.execute("SELECT start_ms FROM files WHERE fid=?", (fid,)).fetchone()
+                if row is not None and row[0] is None:
+                    # Once per file, not once per link: a renewed /d/ link points at
+                    # the same bytes, so a measured offset stays true across relinks.
+                    start = voice_start(url)
+            mark(fid, url, size, name, err, start)
             n += 1
         if n and (n // 20) != ((n - len(done)) // 20):
             conn.commit()
@@ -673,7 +752,7 @@ def payload(conn, path: str) -> dict:
     t = dict(conn.execute("SELECT * FROM titles WHERE path=?", (path,)).fetchone())
     it = conn.execute("SELECT poster FROM items WHERE path=?", (path,)).fetchone()
     files = [dict(r) for r in conn.execute(
-        "SELECT fid, season, ep_from, ep_to, quality, hevc, size_mb, label, lang, host, url, bytes FROM files WHERE path=? ORDER BY season, ep_from, quality", (path,))]
+        "SELECT fid, season, ep_from, ep_to, quality, hevc, size_mb, label, lang, host, url, bytes, start_ms FROM files WHERE path=? ORDER BY season, ep_from, quality", (path,))]
     for f in files:
         f["label"] = f"{t['language'] or ''} {f['label'] or ''}".strip()
         if f["host"] != "r2":
