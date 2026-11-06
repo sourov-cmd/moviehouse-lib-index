@@ -29,31 +29,41 @@ jobs:
           python3 - <<'PY'
           import os, sqlite3, urllib.request, urllib.error
           from urllib.parse import urlparse, quote
-          conn = sqlite3.connect("state/index.sqlite")
-          row = conn.execute("SELECT url FROM files WHERE host='r2' AND url IS NOT NULL AND COALESCE(start_ms,0)=0 LIMIT 1").fetchone()
-          url = row[0]
-          srv = os.environ["P_SERVER"]
-          if "://" not in srv: srv = "http://" + srv
-          u = urlparse(srv)
-          auth = ""
-          if os.environ.get("P_USER"): auth = quote(os.environ["P_USER"], safe="") + ":" + quote(os.environ.get("P_PASS",""), safe="") + "@"
-          proxy = f"{u.scheme}://{auth}{u.hostname}:{u.port}"
           lines = []
-          for label, op in (("proxy", urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))), ("direct", urllib.request.build_opener())):
-              try:
-                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/126.0.0.0", "Range": "bytes=0-1023"})
-                  with op.open(req, timeout=40) as r:
-                      body = r.read(1024)
-                      lines.append(f"{label}: HTTP {r.status} read={len(body)}B type={r.headers.get('Content-Type')} range={r.headers.get('Content-Range')}")
-              except urllib.error.HTTPError as e:
-                  e.read()
-                  lines.append(f"{label}: HTTP {e.code}")
-              except Exception as e:
-                  lines.append(f"{label}: ERROR {type(e).__name__} {str(e)[:120]}")
+          try:
+              conn = sqlite3.connect("state/index.sqlite")
+              lines.append("tables: " + ",".join(r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")))
+              cols = [r[1] for r in conn.execute("PRAGMA table_info(files)")]
+              lines.append("files cols: " + ",".join(cols))
+              for h, n, nu, nm in conn.execute("SELECT host, COUNT(*), SUM(url IS NOT NULL AND url<>''), SUM(COALESCE(start_ms,0)>0) FROM files GROUP BY host"):
+                  lines.append(f"host={h!r} rows={n} with_url={nu} measured={nm}")
+              row = conn.execute("SELECT url FROM files WHERE url IS NOT NULL AND url<>'' AND COALESCE(start_ms,0)=0 LIMIT 1").fetchone()
+              url = row[0] if row else None
+              lines.append("picked url: " + ("yes" if url else "NONE"))
+              if url:
+                  srv = os.environ["P_SERVER"]
+                  if "://" not in srv: srv = "http://" + srv
+                  u = urlparse(srv)
+                  auth = ""
+                  if os.environ.get("P_USER"): auth = quote(os.environ["P_USER"], safe="") + ":" + quote(os.environ.get("P_PASS",""), safe="") + "@"
+                  proxy = f"{u.scheme}://{auth}{u.hostname}:{u.port}"
+                  for label, op in (("proxy", urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))), ("direct", urllib.request.build_opener())):
+                      try:
+                          req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/126.0.0.0", "Range": "bytes=0-1023"})
+                          with op.open(req, timeout=40) as r:
+                              body = r.read(1024)
+                              lines.append(f"{label}: HTTP {r.status} read={len(body)}B type={r.headers.get('Content-Type')} range={r.headers.get('Content-Range')}")
+                      except urllib.error.HTTPError as e:
+                          e.read(); lines.append(f"{label}: HTTP {e.code}")
+                      except Exception as e:
+                          lines.append(f"{label}: ERROR {type(e).__name__} {str(e)[:120]}")
+          except Exception as e:
+              lines.append("FATAL " + type(e).__name__ + " " + str(e)[:200])
           open("out/verdict.txt", "w").write("\n".join(lines) + "\n")
           print("probe done")
           PY
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: proxy-probe-verdict
           path: out/verdict.txt
