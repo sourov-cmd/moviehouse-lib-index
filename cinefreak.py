@@ -53,6 +53,18 @@ DAILY_ROWS = int(os.environ.get("LIB_DAILY_ROWS", "90000"))   # D1 free plan: 10
 ROW_FACTOR = float(os.environ.get("LIB_ROW_FACTOR", "4.0"))
 
 
+
+def clean_title(s):
+    """Owner rule (2026-11-07): the app UI is English only. Strip Bengali-script
+    runs (and the separator junk they leave behind) from an index title; if
+    nothing would remain, keep the original rather than blanking the title."""
+    if not s:
+        return s
+    t = re.sub(r"[ঀ-৿]+", " ", s)
+    t = re.sub(r"\s+", " ", t).strip(" -–|")
+    return t if t else s
+
+
 def deadline_of(name: str) -> float:
     """Epoch seconds from env (LIB_<name>_BY), or never."""
     v = os.environ.get(f"LIB_{name}_BY")
@@ -1433,7 +1445,7 @@ def title_payload(conn, slug: str) -> dict:
     # is written once and an untouched one keeps the exact hash it had (no rewrite of the other ~10,000)
     h = t["hash"] + ("~" + hashlib.sha1(json.dumps(changed, sort_keys=True).encode()).hexdigest()[:8] if changed else "")
     return {
-        "num": LIB_BASE_NUM + (t["post_id"] or 0), "slug": slug, "type": t["type"], "title": title, "aka": aka, "year": t["year"], "_base_hash": t["hash"],
+        "num": LIB_BASE_NUM + (t["post_id"] or 0), "slug": slug, "type": t["type"], "title": clean_title(title), "aka": clean_title(aka) if aka else aka, "year": t["year"], "_base_hash": t["hash"],
         "poster": t["poster"], "overview": t["overview"], "genres": t["genres"], "language": t["language"], "country": t["country"],
         "rating": t["rating"], "releaseDate": t["release_date"], "runtime": t["runtime"], "tmdbId": t["tmdb_id"], "imdbId": t["imdb_id"], "status": t["status"],
         "cats": t["cats"], "ott": t["ott"], "badges": t["badges"], "published": t["published"], "modified": t["modified"], "hash": h, "episodes": eps, "files": files,

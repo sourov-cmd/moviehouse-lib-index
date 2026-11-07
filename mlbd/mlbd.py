@@ -59,6 +59,18 @@ PACE = float(os.environ.get("MLBD_PACE", "0.2"))               # seconds between
 BATCH = int(os.environ.get("MLBD_BATCH", "4"))                 # pages fetched together
 
 
+
+def clean_title(s):
+    """Owner rule (2026-11-07): the app UI is English only. Strip Bengali-script
+    runs (and the separator junk they leave behind) from an index title; if
+    nothing would remain, keep the original rather than blanking the title."""
+    if not s:
+        return s
+    t = re.sub(r"[ঀ-৿]+", " ", s)
+    t = re.sub(r"\s+", " ", t).strip(" -–|")
+    return t if t else s
+
+
 def say(msg: str, private: str = "") -> None:
     print(msg if QUIET or not private else f"{msg} {private}", flush=True)
 
@@ -770,7 +782,7 @@ def payload(conn, path: str) -> dict:
         kind = "movie"
     mx = max([f["bytes"] or 0 for f in files] + [0])
     return {
-        "num": BASE_NUM + int(t["cid"]), "slug": "mlbd-" + path.strip("/").replace("/", "-"), "type": kind, "title": _unent(t["title"]), "aka": _unent(t["aka"]),
+        "num": BASE_NUM + int(t["cid"]), "slug": "mlbd-" + path.strip("/").replace("/", "-"), "type": kind, "title": clean_title(_unent(t["title"])), "aka": clean_title(_unent(t["aka"])) if t.get("aka") else _unent(t["aka"]),
         "year": t["year"], "poster": poster, "overview": _unent(t["overview"]), "genres": t["genres"], "language": t["language"],
         "country": None, "rating": t["rating"], "releaseDate": None, "runtime": None, "tmdbId": None, "imdbId": None, "status": t["status"],
         "cats": ",".join(x for x in (t["kind"].title() if t["kind"] else None, t["language"]) if x), "ott": None, "badges": "Adult" if path.startswith("/download18plus/") else None,
