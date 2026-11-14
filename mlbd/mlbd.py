@@ -6,7 +6,9 @@ dubs like "Nilar Baba" that neither MovieBox nor cinefreak has. It sits behind a
 every request goes through one real browser (mlbd_browser.Session: fetch() inside the page after the challenge).
 
 A file is reached in three hops: the title page's button (obfuscated, mlbd_dec.dec) -> /file/A -> the "fsl" host
-button -> /file/B -> https://fsldownload.com/d/... . That last link is the same in two separate browser sessions,
+button -> /file/B -> the direct link (until 2026-11: https://fsldownload.com/d/... , whose host then lost its
+DNS records; since then an unsigned https://pub-<id>.r2.dev/media/... link on the same page). That last link is
+the same in two separate browser sessions,
 answers a ranged GET with 206 from anywhere (a home line in Dhaka, a Cloudflare Worker, GitHub), with no cookie,
 referer or token: it is kept exactly like the first source's public R2 links (host 'r2' = "a direct, ranged link
 the gateway proves before play"), so the Library worker and the app need no change.
@@ -36,6 +38,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.request
@@ -48,12 +51,26 @@ from mlbd_dec import dec  # noqa: E402
 DB_PATH = os.environ.get("MLBD_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mlbd.sqlite"))
 QUIET = os.environ.get("LIB_QUIET") == "1"
 DAILY_ROWS = int(os.environ.get("LIB_DAILY_ROWS", "40000"))   # this source's share of the D1 free plan (100k rows/day)
+RELINK_RESERVE = int(os.environ.get("LIB_RELINK_RESERVE", "20000"))  # the link renewals always keep this much of the day's budget
+RELINK_ROWS = int(os.environ.get("LIB_RELINK_ROWS", "45000"))  # real rows the renewals may spend per day (1 row/file, measured)
 ROW_FACTOR = float(os.environ.get("LIB_ROW_FACTOR", "4.0"))
 BASE_NUM = 2_100_000_000
 KINDS = ("movie", "series", "drama", "anime", "download18plus")  # 18+ posts carry badges "Adult"
 UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
-PACE = float(os.environ.get("MLBD_PACE", "0.3"))               # seconds between page requests (one tab)
+PACE = float(os.environ.get("MLBD_PACE", "0.2"))               # seconds between page requests (one tab)
 BATCH = int(os.environ.get("MLBD_BATCH", "4"))                 # pages fetched together
+
+
+
+def clean_title(s):
+    """Owner rule (2026-11-07): the app UI is English only. Strip Bengali-script
+    runs (and the separator junk they leave behind) from an index title; if
+    nothing would remain, keep the original rather than blanking the title."""
+    if not s:
+        return s
+    t = re.sub(r"[ঀ-৿]+", " ", s)
+    t = re.sub(r"\s+", " ", t).strip(" -–|")
+    return t if t else s
 
 
 def say(msg: str, private: str = "") -> None:
@@ -89,6 +106,17 @@ def db() -> sqlite3.Connection:
     c = sqlite3.connect(DB_PATH, timeout=60)
     c.row_factory = sqlite3.Row
     c.executescript(SCHEMA)
+    try:  # 2026-10-25: what the Library worker already holds for this file (relink sends only the difference)
+        c.execute("ALTER TABLE files ADD COLUMN pushed_url TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:  # 2026-11-06: where the film begins past the spoken advert (see voice_start);
+        # NULL = not checked yet, 0 = no advert, >0 = the offset the player starts at.
+        # The first source has carried this since its own advert was measured; this
+        # source never did, so its "Downloaded by Movielinkbd" voice played in full.
+        c.execute("ALTER TABLE files ADD COLUMN start_ms INTEGER")
+    except sqlite3.OperationalError:
+        pass
     return c
 
 
@@ -110,8 +138,21 @@ def _attrs(tag: str) -> dict:
     return {k: unescape(v) for k, v in re.findall(r'([\w-]+)="([^"]*)"', tag)}
 
 
+ENTITY = re.compile(r"&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z]+);")
+
+
+def _unent(s: str | None) -> str | None:
+    """The site sometimes escapes twice ("It&amp;#39;s" in the page): unescape until no entity is left (at most 3 rounds).
+    45 older titles reached the Library as "It&#39;s Okay..." / "Ki &amp; Ka" (measured on D1, 2026-10-31)."""
+    for _ in range(3):
+        if not s or not ENTITY.search(s):
+            break
+        s = unescape(s)
+    return s
+
+
 def _text(s: str) -> str:
-    return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", s or ""))).strip()
+    return re.sub(r"\s+", " ", _unent(re.sub(r"<[^>]+>", " ", s or ""))).strip()
 
 
 def _size_mb(label: str) -> float | None:
@@ -298,6 +339,23 @@ async def do_index(s, conn, shards: bool, listing: int) -> None:
         unknown += new_here
         if pg > 2 and not new_here and listing < 50:   # a delta walk stops at the first page it fully knows
             break
+    # 3b. the 18+ listing (Viktor, 2026-10-31): the sitemaps name only 75 of its ~310 posts (measured: /adult18plus
+    #     pages 1-11 = 311 cards, 295 posters; sitemaps 75), so the rest never reached the index. Same cards, same
+    #     poster-keyed delta: the first walk reads every page, later walks stop at the first page they fully know.
+    full18 = not conn.execute("SELECT 1 FROM items WHERE kind='download18plus' AND card_poster IS NOT NULL LIMIT 1").fetchone()
+    seen = {p for _, p in unknown}
+    for pg in range(1, 40):
+        st, x, _ = await s.get("/adult18plus" if pg == 1 else f"/adult18plus/page/{pg}", PACE)
+        if st != 200:
+            break
+        cards = re.findall(r'<a data-mlbd-click-ad="movie-card" href="(/(?:movie|series|drama|anime|download18plus)/[^"]+)">\s*<img[^>]*data-src="([^"]+)"', x)
+        if not cards:
+            break
+        new_here = [(href, poster) for href, poster in cards if poster not in seen and not conn.execute("SELECT 1 FROM items WHERE card_poster=?", (poster,)).fetchone()]
+        seen.update(p for _, p in new_here)
+        unknown += new_here
+        if not full18 and pg > 1 and not new_here:
+            break
     for i in range(0, len(unknown), BATCH):
         part = unknown[i:i + BATCH]
         res = await s.get_many([u for u, _ in part], PACE)
@@ -387,6 +445,70 @@ async def do_crawl(s, conn, limit: int) -> int:
 
 # ---------------------------------------------------------------- resolve
 
+# -----------------------------------------------------------------------------
+# THE SPOKEN ADVERT AT THE START OF THE FILE (2026-11-06)
+# -----------------------------------------------------------------------------
+# The first source cuts its spoken "downloaded by" advert out of playback by
+# measuring where it ends (cinefreak.py voice_start): the player is handed a
+# start offset (start_ms, a column the Library worker already stores and serves
+# for every file), so the film simply begins past the voice. This source never
+# measured it, so its own advert - the "Downloaded by Movielinkbd" voice the
+# owner reported - played in full on every one of its files.
+#
+# The method is cinefreak's, unchanged: the first seconds of audio are matched
+# against a short reference recording of the advert (spectrogram correlation,
+# 0.5 decides), and the film is taken to start 0.2 s after the recording ends.
+# The reference for THIS source lives beside this file as mlbd_ad_ref.raw
+# (8 kHz mono s16le, cut from a confirmed movielinkbd file's own advert, the
+# way ad_ref.raw was cut for the first source). Until that file exists the
+# probe answers None - "not checked" - and nothing about playback changes:
+# a detector without its reference must never guess an offset.
+AD_REF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mlbd_ad_ref.raw")
+AD_SR, AD_HOP, AD_N, AD_MATCH = 8000, 80, 256, 0.5
+_AD = None
+
+
+def _spec(a):
+    import numpy as np
+    frames = np.lib.stride_tricks.sliding_window_view(a, AD_N)[::AD_HOP] * np.hanning(AD_N)
+    s = np.log(np.abs(np.fft.rfft(frames, axis=1))[:, 4:100] + 1e-6)   # ~125 Hz to 3.1 kHz: the voice
+    return s - s.mean(1, keepdims=True)
+
+
+def voice_start(url: str) -> int | None:
+    """Where the film begins past the spoken advert, in ms; 0 when there is none; None when it could not be read."""
+    global _AD
+    try:
+        import numpy as np
+        if _AD is None:
+            ref = np.frombuffer(open(AD_REF, "rb").read(), dtype="<i2").astype(np.float32) / 32768
+            r = _spec(ref)
+            _AD = (r - r.mean()) / r.std()
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Range": "bytes=0-3000000"})
+        with urllib.request.urlopen(req, timeout=40) as resp:
+            head = resp.read(3_000_001)
+        p = subprocess.run(["ffmpeg", "-v", "error", "-i", "pipe:0", "-t", "9", "-map", "0:a:0", "-vn", "-ac", "1", "-ar", str(AD_SR), "-f", "s16le", "pipe:1"],
+                           input=head, capture_output=True, timeout=60)
+        pcm = p.stdout[: len(p.stdout) // 2 * 2]
+        if len(pcm) < AD_SR * 2 * 4:
+            return None
+        a = _spec(np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768)
+        L = len(_AD)
+        if len(a) <= L:
+            return None
+        corr = np.empty(len(a) - L)
+        for k in range(len(corr)):                     # normalised correlation at every 10 ms offset
+            x = a[k:k + L]
+            corr[k] = float(((x - x.mean()) * _AD).mean() / (x.std() + 1e-9))
+        i = int(corr.argmax())
+        if corr[i] < AD_MATCH:
+            return 0
+        # the recording's own length past where it starts, plus 0.2 s of quiet
+        return int(round((i * AD_HOP / AD_SR + L * AD_HOP / AD_SR + 0.2) * 1000))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def check_direct(url: str) -> tuple[int | None, str | None, str | None]:
     """(bytes, filename, error): one ranged GET, as the gateway proves a file before play."""
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Range": "bytes=0-1023"})
@@ -405,6 +527,24 @@ def check_direct(url: str) -> tuple[int | None, str | None, str | None]:
         return (int(m.group(1)) if m else None), name, None
 
 
+# 2026-11-15: fsldownload.com is gone — its DNS records were removed, so every stored /d/ link is dead —
+# and movielinkbd now serves the files from a public Cloudflare R2 bucket: the second hop's page carries an
+# unsigned https://pub-<id>.r2.dev/media/<file>/main link that answers ranged GETs and does not expire.
+# Prefer that link; keep the fsldownload shape as a fallback in case it ever returns.
+DIRECT_RES = (
+    re.compile(r'href="(https://pub-[a-z0-9]+\.r2\.dev/media/[^"]+)"'),
+    re.compile(r'href="(https://fsldownload\.com/d/[^"]+)"'),
+)
+
+
+def direct_link(b: str):
+    for rx in DIRECT_RES:
+        d = rx.findall(b)
+        if d:
+            return unescape(d[0])
+    return None
+
+
 async def resolve_file(s, aurl: str) -> tuple[str | None, str | None]:
     st, a, _ = await s.get(aurl, PACE)
     if st != 200:
@@ -417,8 +557,8 @@ async def resolve_file(s, aurl: str) -> tuple[str | None, str | None]:
     st, b, _ = await s.get(fsl[0], PACE)
     if st != 200:
         return None, f"B http {st}"
-    d = re.findall(r'href="(https://fsldownload\.com/d/[^"]+)"', b)
-    return (unescape(d[0]), None) if d else (None, "no direct link")
+    u = direct_link(b)
+    return (u, None) if u else (None, "no direct link")
 
 
 # A title's /file/ links change with every page view and stop working after a while: production run 38585196510
@@ -427,6 +567,35 @@ async def resolve_file(s, aurl: str) -> tuple[str | None, str | None]:
 # page right before opening its links, unless this run read it less than FRESH_S seconds ago.
 FRESH: dict[str, float] = {}
 FRESH_S = int(os.environ.get("MLBD_FRESH_S", "600"))
+
+
+def resend_relinked_once(conn) -> None:
+    """One-time (Viktor, 2026-10-31): the 410 sweep parked 20,471 expired links in the Library as host='dead', and the
+    Library's /relink then only touched host='r2' rows, so renewed links never reached them (the 00:39 run sent 2,813
+    and 11 rows changed). The worker now revives a 'dead' row with its renewed link; send again every link this
+    crawler has proven alive in the last 20 h (fresh resolve or recheck, res_err NULL). A link it found dead keeps
+    its pushed_url, so no dead link is sent."""
+    if conn.execute("SELECT v FROM meta WHERE k='relink_dead_20261031'").fetchone():
+        return
+    n = conn.execute("UPDATE files SET pushed_url=NULL WHERE host='r2' AND url IS NOT NULL AND res_err IS NULL "
+                     "AND resolved_at > ?", (int(time.time()) - 20 * 3600,)).rowcount
+    meta_set(conn, "relink_dead_20261031", str(n))
+    conn.commit()
+    print(f"[reset] {n} living links will be sent to the Library again", flush=True)
+
+
+def resend_filmlike_once(conn) -> None:
+    """One-time (2026-10-15): series-typed posts whose files carry no season were sent as "tv" and could not play; send
+    them again (payload() now sends them as films)."""
+    if conn.execute("SELECT v FROM meta WHERE k='filmlike_20261015'").fetchone():
+        return
+    n = conn.execute("UPDATE titles SET pushed_hash=NULL WHERE pushed_hash IS NOT NULL AND kind IN ('series','drama','anime') "
+                     "AND NOT EXISTS(SELECT 1 FROM episodes e WHERE e.path=titles.path) "
+                     "AND EXISTS(SELECT 1 FROM files f WHERE f.path=titles.path) "
+                     "AND NOT EXISTS(SELECT 1 FROM files f WHERE f.path=titles.path AND f.season IS NOT NULL)").rowcount
+    meta_set(conn, "filmlike_20261015", str(n))
+    conn.commit()
+    print(f"[reset] {n} film-like series will be sent again as films", flush=True)
 
 
 def reset_stale_once(conn) -> None:
@@ -446,18 +615,48 @@ async def do_resolve(s, conn, limit: int) -> int:
         "SELECT f.fid, f.path, f.aurl FROM files f JOIN items i ON i.path=f.path WHERE f.aurl IS NOT NULL AND "
         "(f.resolved_at IS NULL OR (f.res_err IS NOT NULL AND f.res_err NOT LIKE 'archive%' AND f.resolved_at < ?)) "
         "ORDER BY COALESCE(i.lastmod,'') DESC, f.quality=720 DESC, f.quality DESC LIMIT ?", (int(time.time()) - 86400, limit)).fetchall()
+    # Viktor 2026-11-03: posts found only on the /adult18plus listing carry no sitemap lastmod, so COALESCE(lastmod,'')
+    # sorted them last and the 1,500-file round (always full of link renewals) never reached them: 292 18+ posts were
+    # indexed on 31 Oct but only 76 reached the Library by 3 Nov. A fifth of every round now goes to files that were
+    # never resolved at all (18+ first), so new posts always move, whatever the renewal backlog.
+    fresh = conn.execute(
+        "SELECT f.fid, f.path, f.aurl FROM files f JOIN items i ON i.path=f.path WHERE f.aurl IS NOT NULL AND f.resolved_at IS NULL "
+        "ORDER BY i.kind='download18plus' DESC, COALESCE(i.lastmod,'') DESC, f.quality=720 DESC, f.quality DESC LIMIT ?",
+        (max(1, limit // 5),)).fetchall()
+    if fresh:
+        have = {r["fid"] for r in fresh}
+        rows = sorted(fresh, key=lambda r: r["path"]) + [r for r in rows if r["fid"] not in have][: max(0, limit - len(fresh))]
     only = os.environ.get("MLBD_ONLY")   # a test resolves just the kind it read
     if only:
         rows = conn.execute("SELECT fid, path, aurl FROM files WHERE aurl IS NOT NULL AND resolved_at IS NULL AND path LIKE ? LIMIT ?", (only + "%", limit)).fetchall()
     by = deadline("RESOLVE")
     print(f"[resolve] {len(rows)} files", flush=True)
     n, stat = 0, {}
+    diag_b: list = []
     refetched = 0
+    # owner 2026-10-25: the site answers each request in ~2 s, so one-sequential-request-per-hop
+    # resolved only ~1.2k files/h while ~2.4k/h cross the 23.1 h link-expiry line. Both hops are
+    # ordinary page reads, so they go through get_many (4 in parallel, the way crawl reads pages):
+    # a title's /file/ pages together, then that title's fsl pages together.
+    groups: list[list] = []
     for r in rows:
+        if groups and groups[-1][0]["path"] == r["path"]:
+            groups[-1].append(r)
+        else:
+            groups.append([r])
+
+    def mark(fid: str, url, size, name, err, start=None):
+        host = "r2" if url and not err else None
+        key = "ok" if host else " ".join((err or "?").split(" ")[:2])
+        stat[key] = stat.get(key, 0) + 1
+        conn.execute("UPDATE files SET host=?, url=?, bytes=?, fname=?, resolved_at=?, res_err=?, start_ms=COALESCE(?, start_ms) WHERE fid=?",
+                     (host, url if host else None, size, name, int(time.time()), err, start, fid))
+
+    for g in groups:
         if time.time() > by:
             say(f"[resolve] time budget reached at {n}/{len(rows)}")
             break
-        path = r["path"]
+        path = g[0]["path"]
         if time.time() - FRESH.get(path, 0) > FRESH_S:
             await s.tidy()
             st, x, _ = await s.get(path, PACE)
@@ -467,28 +666,123 @@ async def do_resolve(s, conn, limit: int) -> int:
                 store_title(conn, parse_title(x), path)
             else:
                 conn.execute("UPDATE items SET fetched_at=?, err=? WHERE path=?", (int(time.time()), f"http {st}", path))
-        cur = conn.execute("SELECT aurl FROM files WHERE fid=?", (r["fid"],)).fetchone()
-        if not cur or not cur["aurl"]:
-            continue   # the button is gone from the page: store_title deleted the file
-        url, err, size, name = None, None, None, None
-        try:
-            url, err = await resolve_file(s, cur["aurl"])
-            if url:
-                size, name, err = await asyncio.to_thread(check_direct, url)
-        except Exception as e:  # noqa: BLE001
-            err = str(e)[:150]
-        host = "r2" if url and not err else None
-        key = "ok" if host else " ".join((err or "?").split(" ")[:2])
-        stat[key] = stat.get(key, 0) + 1
-        conn.execute("UPDATE files SET host=?, url=?, bytes=?, fname=?, resolved_at=?, res_err=? WHERE fid=?",
-                     (host, url if host else None, size, name, int(time.time()), err, r["fid"]))
-        n += 1
-        if n % 20 == 0:
+        fids = [r["fid"] for r in g]
+        cur = {r["fid"]: r["aurl"] for r in conn.execute(
+            f"SELECT fid, aurl FROM files WHERE fid IN ({','.join('?' * len(fids))})", fids).fetchall()}
+        todo = [(fid, a) for fid, a in ((fid, cur.get(fid)) for fid in fids) if a]
+        # hop 1: the /file/ pages (batched)
+        pages = await s.get_many([a for _, a in todo], PACE)
+        hops, done = [], []
+        for (fid, _a), r in zip(todo, pages):
+            st, x = r[0], r[1]
+            if st != 200:
+                done.append((fid, None, None, None, f"A http {st}"))
+                continue
+            fsl = [_attrs(t).get("href") for t in re.findall(r'<a\b[^>]*data-host="fsl"[^>]*>', x)]
+            fsl = [u for u in fsl if u]
+            if not fsl:
+                hosts = sorted({_attrs(t).get("data-host") for t in re.findall(r'<a\b[^>]*data-host="[^"]+"[^>]*>', x)})
+                done.append((fid, None, None, None, "no fsl (" + ",".join(h for h in hosts if h)[:60] + ")"))
+                continue
+            hops.append((fid, fsl[0]))
+        # hop 2: the fsl pages (batched)
+        direct = await s.get_many([u for _, u in hops], PACE) if hops else []
+        fetched = []
+        for (fid, _u), r in zip(hops, direct):
+            st, x = r[0], r[1]
+            if st != 200:
+                done.append((fid, None, None, None, f"B http {st}"))
+                continue
+            u = direct_link(x)
+            if not u:
+                if os.environ.get("TEST") and len(diag_b) < 10:
+                    diag_b.append(fid)
+                    hosts = {}
+                    for hst in re.findall(r'href="https://([^"/]+)', x):
+                        hosts[hst] = hosts.get(hst, 0) + 1
+                    print(f"[diag] B page without a direct link; href hosts: {hosts}", flush=True)
+                done.append((fid, None, None, None, "no direct link"))
+                continue
+            fetched.append((fid, u))
+        # the ranged proof is plain urllib (no session): all of a title's files together
+        async def _proof(u):
+            try:
+                return await asyncio.to_thread(check_direct, u)
+            except Exception as e:  # noqa: BLE001  (403/410 answer as an error, not a crash)
+                return (None, None, str(e)[:150])
+        proofs = await asyncio.gather(*[_proof(u) for _, u in fetched]) if fetched else []
+        for (fid, u), (size, name, perr) in zip(fetched, proofs):
+            done.append((fid, u, size, name, perr))
+        for fid, url, size, name, err in done:
+            start = None
+            if url and not err:
+                row = conn.execute("SELECT start_ms FROM files WHERE fid=?", (fid,)).fetchone()
+                if row is not None and row[0] is None:
+                    # Once per file, not once per link: a renewed /d/ link points at
+                    # the same bytes, so a measured offset stays true across relinks.
+                    start = voice_start(url)
+            mark(fid, url, size, name, err, start)
+            n += 1
+        if n and (n // 20) != ((n - len(done)) // 20):
             conn.commit()
             print(f"[resolve] {n}/{len(rows)} {json.dumps(stat, sort_keys=True)} re-read {refetched} req={s.nreq}", flush=True)
     conn.commit()
     print(f"[resolve] done {n} {json.dumps(stat, sort_keys=True)} re-read {refetched}", flush=True)
     return n
+
+
+async def do_recheck(conn, limit: int) -> int:
+    """The stored direct links rot (owner, 2026-10-25).
+    =============================================================================
+    *"movielinkbd এরগুলো আসলেও কি যেনো সমস্যার কারণে কিছু ঘণ্টা পর চলে না"*. Live 2026-10-25:
+    a 45-title random play sample through the gateway answered 6 ok / 35 no_server / 4 no_file —
+    the file host healthy, the index's stored links dead. Nothing ever looked at a resolved link
+    again. One cheap ranged GET per stored link, oldest resolved first (see cinefreak.py
+    cmd_recheck for the full owner note): a healthy link gets resolved_at renewed (coverage
+    rotates through the whole index, and the push hash changes so the title is re-pushed), a dead
+    one gets res_err='dead link', resolved_at=0 so this run's resolve re-resolves it while the
+    page's button is still there.
+    """
+    rows = conn.execute(
+        "SELECT fid, url FROM files WHERE host='r2' AND url IS NOT NULL "
+        "ORDER BY COALESCE(resolved_at, 0) ASC LIMIT ?", (limit,)).fetchall()
+    by = min(deadline("RESOLVE"), time.time() + float(os.environ.get("LIB_RECHECK_SECONDS", "240")))
+    print(f"[recheck] {len(rows)} stored links, oldest resolved first", flush=True)
+    alive = dead = n = 0
+
+    def alive_of(url: str) -> bool:
+        try:
+            return check_direct(url)[2] is None
+        except Exception:
+            return False
+
+    async def one(r):
+        return r["fid"], await asyncio.to_thread(alive_of, r["url"])
+
+    # real Tasks, not bare coroutines: the time-budget break calls t.cancel(), and a bare
+    # coroutine has no .cancel() (the 09:56 run crashed there on its first budget hit)
+    tasks = [asyncio.ensure_future(one(r)) for r in rows]
+    try:
+        for fut in asyncio.as_completed(tasks):
+            if time.time() > by:
+                for t in tasks: t.cancel()
+                break
+            fid, ok = await fut
+            if ok:
+                alive += 1
+                conn.execute("UPDATE files SET resolved_at=? WHERE fid=?", (int(time.time()), fid))
+            else:
+                dead += 1
+                conn.execute("UPDATE files SET resolved_at=0, res_err='dead link' WHERE fid=?", (fid,))
+            n += 1
+            if n % 50 == 0:
+                conn.commit()
+                print(f"[recheck] {n}/{len(rows)} alive {alive} dead {dead} req={n}", flush=True)
+    finally:
+        pass
+    conn.commit()
+    print(f"[recheck] alive {alive}, dead {dead}", flush=True)
+    return dead
 
 
 # ---------------------------------------------------------------- push
@@ -497,7 +791,7 @@ def payload(conn, path: str) -> dict:
     t = dict(conn.execute("SELECT * FROM titles WHERE path=?", (path,)).fetchone())
     it = conn.execute("SELECT poster FROM items WHERE path=?", (path,)).fetchone()
     files = [dict(r) for r in conn.execute(
-        "SELECT fid, season, ep_from, ep_to, quality, hevc, size_mb, label, lang, host, url, bytes FROM files WHERE path=? ORDER BY season, ep_from, quality", (path,))]
+        "SELECT fid, season, ep_from, ep_to, quality, hevc, size_mb, label, lang, host, url, bytes, start_ms FROM files WHERE path=? ORDER BY season, ep_from, quality", (path,))]
     for f in files:
         f["label"] = f"{t['language'] or ''} {f['label'] or ''}".strip()
         if f["host"] != "r2":
@@ -507,20 +801,79 @@ def payload(conn, path: str) -> dict:
     if poster and "image.tmdb.org" in poster:
         poster = poster.replace("/original/", "/w500/")
     kind = "tv" if t["kind"] in ("series", "drama") or (t["kind"] == "anime" and eps) else "movie"
+    # A post typed "series" that lists its files like a film (no episode cards, every file without a season) goes out
+    # as a film (Viktor, 2026-10-15): as "tv" the app asked for season 1 and found no file, so it could not play
+    # (measured: "Ek Anjaan Rishtey Ka Guilt 5"). ":m" changes the hash, so the worker rewrites a title already sent.
+    as_film = kind == "tv" and not eps and bool(files) and all(f["season"] is None for f in files)
+    if as_film:
+        kind = "movie"
     mx = max([f["bytes"] or 0 for f in files] + [0])
     return {
-        "num": BASE_NUM + int(t["cid"]), "slug": "mlbd-" + path.strip("/").replace("/", "-"), "type": kind, "title": t["title"], "aka": t["aka"],
-        "year": t["year"], "poster": poster, "overview": t["overview"], "genres": t["genres"], "language": t["language"],
+        "num": BASE_NUM + int(t["cid"]), "slug": "mlbd-" + path.strip("/").replace("/", "-"), "type": kind, "title": clean_title(_unent(t["title"])), "aka": clean_title(_unent(t["aka"])) if t.get("aka") else _unent(t["aka"]),
+        "year": t["year"], "poster": poster, "overview": _unent(t["overview"]), "genres": t["genres"], "language": t["language"],
         "country": None, "rating": t["rating"], "releaseDate": None, "runtime": None, "tmdbId": None, "imdbId": None, "status": t["status"],
         "cats": ",".join(x for x in (t["kind"].title() if t["kind"] else None, t["language"]) if x), "ott": None, "badges": "Adult" if path.startswith("/download18plus/") else None,
-        "published": None, "modified": None, "hash": f"{t['hash']}:{mx}", "episodes": eps, "files": files,
+        "published": None, "modified": None, "hash": f"{t['hash']}:{mx}" + (":m" if as_film else ""), "episodes": eps, "files": files,
     }
+
+
+def do_relink(conn, base: str, key: str) -> int:
+    """Renew only the fsldownload links: POST /relink writes ONE row per file, a full ingest
+    writes ~2 + files + episodes rows per title. The stored links die after ~23.1 h (measured,
+    lib-worker relink note), so a living library needs every file renewed roughly daily — at full
+    ingest cost that is ~90k rows/day against a 100k/day free plan; at relink cost ~56k. Only
+    metadata-unchanged titles are relinked; anything the page changed goes through /ingest."""
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    # owner 2026-10-25: relink is billed ~1 real row per file (verified: est +2,761 vs D1's real
+    # 2,805 in the 06:00 hour), while the shared push estimate runs ~1.5x over the real D1 count
+    # (est 77.7k vs measured 51.2k). One conservative estimate must not starve the renewals, so
+    # relink keeps its own real-rows counter with its own cap.
+    spent = int(meta_get(conn, f"relinkrows:{day}", 0))
+    if spent + 250 > RELINK_ROWS:
+        say(f"[relink] today's relink row budget is used ({spent}/{RELINK_ROWS} real rows)")
+        return 0
+    rows = conn.execute(
+        "SELECT f.fid, f.url FROM files f JOIN titles t ON t.path=f.path "
+        "WHERE f.host='r2' AND f.url IS NOT NULL AND (f.pushed_url IS NULL OR f.pushed_url IS NOT f.url) "
+        "AND t.pushed_hash IS NOT NULL ORDER BY f.rowid LIMIT 8000").fetchall()
+    if not rows:
+        return 0
+    sent = 0
+    for i in range(0, len(rows), 250):
+        part = rows[i:i + 250]
+        if spent + len(part) > RELINK_ROWS:
+            break
+        body = json.dumps({"files": [{"fid": r["fid"], "url": r["url"]} for r in part]}).encode()
+        req = urllib.request.Request(base.rstrip("/") + "/relink", data=body, method="POST",
+                                     headers={"content-type": "application/json", "x-lib-key": key,
+                                              "user-agent": "MovieHouse-LibIndex/2"})
+        res = None
+        for k in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    res = json.loads(r.read().decode())
+                break
+            except Exception:  # noqa: BLE001
+                if k == 3:
+                    raise
+                time.sleep(5 * (k + 1))
+        if not res or not res.get("ok"):
+            raise RuntimeError("relink refused")
+        used = int(res.get("rows_written") or 0) + 1  # +1: the lib_meta updated_at write
+        spent += used
+        meta_set(conn, f"relinkrows:{day}", spent)
+        for r in part:
+            conn.execute("UPDATE files SET pushed_url=? WHERE fid=?", (r["url"], r["fid"]))
+        conn.commit()
+        sent += len(part)
+    print(f"[relink] done {sent} files, relink rows today={spent}/{RELINK_ROWS}", flush=True)
+    return sent
 
 
 def do_push(conn, base: str, key: str, limit: int = 100000, batch: int = 25) -> int:
     day = time.strftime("%Y-%m-%d", time.gmtime())
     spent = int(meta_get(conn, f"rows:{day}", 0))
-    budget = DAILY_ROWS - spent
+    budget = DAILY_ROWS - RELINK_RESERVE - spent
     if budget <= 0:
         say(f"[push] today's D1 write budget is used ({spent} est. rows)")
         return 0
@@ -530,7 +883,13 @@ def do_push(conn, base: str, key: str, limit: int = 100000, batch: int = 25) -> 
         "WHERE t.cid IS NOT NULL AND NOT EXISTS(SELECT 1 FROM files f WHERE f.path=t.path AND f.resolved_at IS NULL) "
         "AND (t.pushed_hash IS NOT NULL OR EXISTS(SELECT 1 FROM files f WHERE f.path=t.path AND f.host='r2')) "
         "ORDER BY t.fetched_at DESC LIMIT ?", (limit,)).fetchall()
-    rows = [r for r in rows if conn.execute("SELECT pushed_hash FROM titles WHERE path=?", (r["path"],)).fetchone()[0] != f"{conn.execute('SELECT hash FROM titles WHERE path=?', (r['path'],)).fetchone()[0]}:{r['mx']}"]
+    # owner 2026-10-25: a title whose page is unchanged needs only its links renewed (do_relink);
+    # the old rule re-ingested every resolved title (~7 rows each), which a daily link sweep cannot afford.
+    def hash_only(path):
+        ph = conn.execute("SELECT pushed_hash FROM titles WHERE path=?", (path,)).fetchone()[0]
+        h = conn.execute("SELECT hash FROM titles WHERE path=?", (path,)).fetchone()[0]
+        return ph is not None and ph.rsplit(":", 1)[0] == h
+    rows = [r for r in rows if not hash_only(r["path"])]
     print(f"[push] {len(rows)} titles waiting; budget {budget} est. rows today", flush=True)
     sent = used = 0
     cur: list = []
@@ -557,6 +916,7 @@ def do_push(conn, base: str, key: str, limit: int = 100000, batch: int = 25) -> 
         for p, path, mx in cur:
             h = conn.execute("SELECT hash FROM titles WHERE path=?", (path,)).fetchone()[0]
             conn.execute("UPDATE titles SET pushed_hash=? WHERE path=?", (f"{h}:{mx}", path))
+            conn.execute("UPDATE files SET pushed_url=url WHERE path=? AND url IS NOT NULL", (path,))
         used += max(int(int(res.get("written") or 0) * ROW_FACTOR), len(cur))
         meta_set(conn, f"rows:{day}", spent + used)
         conn.commit()
@@ -596,6 +956,8 @@ async def run(args) -> None:
     conn = db()
     if args.cmd == "stats":
         stats(conn); return
+    if args.cmd == "recheck":
+        await do_recheck(conn, args.limit); return
     if args.cmd == "push":
         do_push(conn, args.base or os.environ.get("LIB_BASE", ""), args.key or os.environ.get("LIB_KEY", "")); return
     from patchright.async_api import async_playwright
@@ -608,6 +970,8 @@ async def run(args) -> None:
         print("[mlbd] challenge passed", flush=True)
         try:
             reset_stale_once(conn)
+            resend_filmlike_once(conn)
+            resend_relinked_once(conn)
             if args.cmd in ("index", "cycle"):
                 await do_index(s, conn, getattr(args, "shards", False) or not conn.execute("SELECT 1 FROM items LIMIT 1").fetchone(), args.listing)
             if args.cmd == "crawl":
@@ -617,12 +981,17 @@ async def run(args) -> None:
             if args.cmd == "cycle":
                 base, key = os.environ.get("LIB_BASE", ""), os.environ.get("LIB_KEY", "")
                 await do_crawl(s, conn, args.limit)
+                await do_recheck(conn, args.limit)
                 by = deadline("RESOLVE")
+                # owner 2026-10-25: one round per run is far too slow — the recheck found 55,999 dead
+                # links (99% of the stored mlbd links die within hours). Keep resolving round after
+                # round until the run's time budget is spent; the round only bounds a single batch.
                 while time.time() < by - 60:
                     n = await do_resolve(s, conn, args.round)
                     if base and key and os.environ.get("MLBD_PUSH") == "1":
+                        do_relink(conn, base, key)
                         do_push(conn, base, key)
-                    if n < args.round:
+                    if n == 0:
                         break
         finally:
             conn.commit()
@@ -636,9 +1005,10 @@ def main():
     i = sub.add_parser("index"); i.add_argument("--shards", action="store_true"); i.add_argument("--listing", type=int, default=3)
     c = sub.add_parser("crawl"); c.add_argument("--limit", type=int, default=100000)
     r = sub.add_parser("resolve"); r.add_argument("--limit", type=int, default=100000)
+    k = sub.add_parser("recheck"); k.add_argument("--limit", type=int, default=100000)
     p = sub.add_parser("push"); p.add_argument("--base"); p.add_argument("--key")
     y = sub.add_parser("cycle"); y.add_argument("--listing", type=int, default=3); y.add_argument("--limit", type=int, default=100000)
-    y.add_argument("--round", type=int, default=300)
+    y.add_argument("--round", type=int, default=1500)
     sub.add_parser("stats")
     asyncio.run(run(ap.parse_args()))
 
