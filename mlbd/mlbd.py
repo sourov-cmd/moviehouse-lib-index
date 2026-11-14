@@ -528,21 +528,27 @@ def check_direct(url: str) -> tuple[int | None, str | None, str | None]:
 
 
 # 2026-11-15: fsldownload.com is gone — its DNS records were removed, so every stored /d/ link is dead —
-# and movielinkbd now serves the files from a public Cloudflare R2 bucket: the second hop's page carries an
-# unsigned https://pub-<id>.r2.dev/media/<file>/main link that answers ranged GETs and does not expire.
-# Prefer that link; keep the fsldownload shape as a fallback in case it ever returns.
+# and movielinkbd now serves the files from a public Cloudflare R2 bucket: the hop page carries unsigned
+# https://pub-<id>.r2.dev links that answer ranged GETs and do not expire.
+# v1 assumed the /media/<id>/main path (seen on the ONE CLICK final page); TEST run 43624932902 proved the
+# FSL hop page's two pub-*.r2.dev hrefs use a DIFFERENT path (2,000 files, 0 direct, yet the diag showed the
+# host present on every B page). v2: match ANY path on the pub host and let the ranged proof (check_direct)
+# decide which candidate is the file — a watch page or thumbnail fails the video check and is skipped.
+# Keep the fsldownload shape as a last-resort candidate in case it ever returns.
 DIRECT_RES = (
-    re.compile(r'href="(https://pub-[a-z0-9]+\.r2\.dev/media/[^"]+)"'),
+    re.compile(r'href="(https://pub-[a-z0-9]+\.r2\.dev/[^"]+)"'),
     re.compile(r'href="(https://fsldownload\.com/d/[^"]+)"'),
 )
 
 
-def direct_link(b: str):
+def direct_links(b: str) -> list[str]:
+    out: list[str] = []
     for rx in DIRECT_RES:
-        d = rx.findall(b)
-        if d:
-            return unescape(d[0])
-    return None
+        for u in rx.findall(b):
+            u = unescape(u)
+            if u not in out:
+                out.append(u)
+    return out
 
 
 async def resolve_file(s, aurl: str) -> tuple[str | None, str | None]:
@@ -557,8 +563,14 @@ async def resolve_file(s, aurl: str) -> tuple[str | None, str | None]:
     st, b, _ = await s.get(fsl[0], PACE)
     if st != 200:
         return None, f"B http {st}"
-    u = direct_link(b)
-    return (u, None) if u else (None, "no direct link")
+    for u in direct_links(b):
+        try:
+            _size, _name, err = await asyncio.to_thread(check_direct, u)
+        except Exception as e:  # noqa: BLE001
+            err = str(e)[:150]
+        if not err:
+            return u, None
+    return None, "no direct link"
 
 
 # A title's /file/ links change with every page view and stop working after a while: production run 38585196510
@@ -687,14 +699,14 @@ async def do_resolve(s, conn, limit: int) -> int:
             hops.append((fid, fsl[0]))
         # hop 2: the fsl pages (batched)
         direct = await s.get_many([u for _, u in hops], PACE) if hops else []
-        fetched = []
+        fetched = []  # (fid, [candidate urls]) — the ranged proof picks the first that is a video
         for (fid, _u), r in zip(hops, direct):
             st, x = r[0], r[1]
             if st != 200:
                 done.append((fid, None, None, None, f"B http {st}"))
                 continue
-            u = direct_link(x)
-            if not u:
+            cands = direct_links(x)
+            if not cands:
                 if os.environ.get("TEST") and len(diag_b) < 10:
                     diag_b.append(fid)
                     hosts = {}
@@ -703,16 +715,30 @@ async def do_resolve(s, conn, limit: int) -> int:
                     print(f"[diag] B page without a direct link; href hosts: {hosts}", flush=True)
                 done.append((fid, None, None, None, "no direct link"))
                 continue
-            fetched.append((fid, u))
-        # the ranged proof is plain urllib (no session): all of a title's files together
+            fetched.append((fid, cands))
+        # the ranged proof is plain urllib (no session): all of a title's files together.
+        # Try every candidate in order; the first that answers 206 + video/* wins. A B page
+        # can carry more than one pub-*.r2.dev href (watch page + file), so a single pick is wrong.
         async def _proof(u):
             try:
                 return await asyncio.to_thread(check_direct, u)
             except Exception as e:  # noqa: BLE001  (403/410 answer as an error, not a crash)
                 return (None, None, str(e)[:150])
-        proofs = await asyncio.gather(*[_proof(u) for _, u in fetched]) if fetched else []
-        for (fid, u), (size, name, perr) in zip(fetched, proofs):
-            done.append((fid, u, size, name, perr))
+        flat = [(fid, u) for fid, cands in fetched for u in cands]
+        proofs = await asyncio.gather(*[_proof(u) for _, u in flat]) if flat else []
+        won = {}
+        for (fid, u), (size, name, perr) in zip(flat, proofs):
+            if fid not in won and not perr:
+                won[fid] = (u, size, name)
+        for fid, cands in fetched:
+            if fid in won:
+                u, size, name = won[fid]
+                done.append((fid, u, size, name, None))
+            else:
+                if os.environ.get("TEST") and len(diag_b) < 10:
+                    diag_b.append(fid)
+                    print(f"[diag] B page candidates all failed proof: {[c[:160] for c in cands[:3]]}", flush=True)
+                done.append((fid, None, None, None, "no direct link"))
         for fid, url, size, name, err in done:
             start = None
             if url and not err:
