@@ -535,8 +535,18 @@ def check_direct(url: str) -> tuple[int | None, str | None, str | None]:
 # host present on every B page). v2: match ANY path on the pub host and let the ranged proof (check_direct)
 # decide which candidate is the file — a watch page or thumbnail fails the video check and is skipped.
 # Keep the fsldownload shape as a last-resort candidate in case it ever returns.
+# v3 (2026-11-15, TEST-2 run 43634734869 + a live browser trace of the FSL route): TEST-2 also extracted 0 —
+# the ONLY pub-*.r2.dev href on the B page is the site's favicon.ico. The browser trace (3 files) shows the
+# FSL route today: options page -> FSL page ("FAST SERVER LINK / Ready to Download") -> its single button
+# "FSL - DOWNLOAD NOW" points at https://fsl.mks-lukatube.workers.dev/d/<token> — MLBD's own proxy, the
+# fsldownload replacement (same /d/<token> shape; the B-page href census in TEST-1 already listed this host).
+# Proven by a direct ranged GET from outside the browser: 206, Content-Type video/x-matroska, Content-Range
+# total matching the file's stated size, Content-Disposition with the file's name — the proxy streams the
+# file itself, no redirect. So the B page's workers.dev /d/ href is a first-class candidate: check_direct
+# proves it like any other, and the existing recheck/resolve/relink cycle renews it if its token ever dies.
 DIRECT_RES = (
     re.compile(r'href="(https://pub-[a-z0-9]+\.r2\.dev/[^"]+)"'),
+    re.compile(r'href="(https://fsl\.mks-lukatube\.workers\.dev/d/[^"]+)"'),
     re.compile(r'href="(https://fsldownload\.com/d/[^"]+)"'),
 )
 
