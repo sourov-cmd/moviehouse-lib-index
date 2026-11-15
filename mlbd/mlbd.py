@@ -6,7 +6,9 @@ dubs like "Nilar Baba" that neither MovieBox nor cinefreak has. It sits behind a
 every request goes through one real browser (mlbd_browser.Session: fetch() inside the page after the challenge).
 
 A file is reached in three hops: the title page's button (obfuscated, mlbd_dec.dec) -> /file/A -> the "fsl" host
-button -> /file/B -> https://fsldownload.com/d/... . That last link is the same in two separate browser sessions,
+button -> /file/B -> the direct link (until 2026-11: https://fsldownload.com/d/... , whose host then lost its
+DNS records; since then an unsigned https://pub-<id>.r2.dev/media/... link on the same page). That last link is
+the same in two separate browser sessions,
 answers a ranged GET with 206 from anywhere (a home line in Dhaka, a Cloudflare Worker, GitHub), with no cookie,
 referer or token: it is kept exactly like the first source's public R2 links (host 'r2' = "a direct, ranged link
 the gateway proves before play"), so the Library worker and the app need no change.
@@ -525,6 +527,40 @@ def check_direct(url: str) -> tuple[int | None, str | None, str | None]:
         return (int(m.group(1)) if m else None), name, None
 
 
+# 2026-11-15: fsldownload.com is gone — its DNS records were removed, so every stored /d/ link is dead —
+# and movielinkbd now serves the files from a public Cloudflare R2 bucket: the hop page carries unsigned
+# https://pub-<id>.r2.dev links that answer ranged GETs and do not expire.
+# v1 assumed the /media/<id>/main path (seen on the ONE CLICK final page); TEST run 43624932902 proved the
+# FSL hop page's two pub-*.r2.dev hrefs use a DIFFERENT path (2,000 files, 0 direct, yet the diag showed the
+# host present on every B page). v2: match ANY path on the pub host and let the ranged proof (check_direct)
+# decide which candidate is the file — a watch page or thumbnail fails the video check and is skipped.
+# Keep the fsldownload shape as a last-resort candidate in case it ever returns.
+# v3 (2026-11-15, TEST-2 run 43634734869 + a live browser trace of the FSL route): TEST-2 also extracted 0 —
+# the ONLY pub-*.r2.dev href on the B page is the site's favicon.ico. The browser trace (3 files) shows the
+# FSL route today: options page -> FSL page ("FAST SERVER LINK / Ready to Download") -> its single button
+# "FSL - DOWNLOAD NOW" points at https://fsl.mks-lukatube.workers.dev/d/<token> — MLBD's own proxy, the
+# fsldownload replacement (same /d/<token> shape; the B-page href census in TEST-1 already listed this host).
+# Proven by a direct ranged GET from outside the browser: 206, Content-Type video/x-matroska, Content-Range
+# total matching the file's stated size, Content-Disposition with the file's name — the proxy streams the
+# file itself, no redirect. So the B page's workers.dev /d/ href is a first-class candidate: check_direct
+# proves it like any other, and the existing recheck/resolve/relink cycle renews it if its token ever dies.
+DIRECT_RES = (
+    re.compile(r'href="(https://pub-[a-z0-9]+\.r2\.dev/[^"]+)"'),
+    re.compile(r'href="(https://fsl\.mks-lukatube\.workers\.dev/d/[^"]+)"'),
+    re.compile(r'href="(https://fsldownload\.com/d/[^"]+)"'),
+)
+
+
+def direct_links(b: str) -> list[str]:
+    out: list[str] = []
+    for rx in DIRECT_RES:
+        for u in rx.findall(b):
+            u = unescape(u)
+            if u not in out:
+                out.append(u)
+    return out
+
+
 async def resolve_file(s, aurl: str) -> tuple[str | None, str | None]:
     st, a, _ = await s.get(aurl, PACE)
     if st != 200:
@@ -537,8 +573,14 @@ async def resolve_file(s, aurl: str) -> tuple[str | None, str | None]:
     st, b, _ = await s.get(fsl[0], PACE)
     if st != 200:
         return None, f"B http {st}"
-    d = re.findall(r'href="(https://fsldownload\.com/d/[^"]+)"', b)
-    return (unescape(d[0]), None) if d else (None, "no direct link")
+    for u in direct_links(b):
+        try:
+            _size, _name, err = await asyncio.to_thread(check_direct, u)
+        except Exception as e:  # noqa: BLE001
+            err = str(e)[:150]
+        if not err:
+            return u, None
+    return None, "no direct link"
 
 
 # A title's /file/ links change with every page view and stop working after a while: production run 38585196510
@@ -612,6 +654,7 @@ async def do_resolve(s, conn, limit: int) -> int:
     by = deadline("RESOLVE")
     print(f"[resolve] {len(rows)} files", flush=True)
     n, stat = 0, {}
+    diag_b: list = []
     refetched = 0
     # owner 2026-10-25: the site answers each request in ~2 s, so one-sequential-request-per-hop
     # resolved only ~1.2k files/h while ~2.4k/h cross the 23.1 h link-expiry line. Both hops are
@@ -666,26 +709,46 @@ async def do_resolve(s, conn, limit: int) -> int:
             hops.append((fid, fsl[0]))
         # hop 2: the fsl pages (batched)
         direct = await s.get_many([u for _, u in hops], PACE) if hops else []
-        fetched = []
+        fetched = []  # (fid, [candidate urls]) — the ranged proof picks the first that is a video
         for (fid, _u), r in zip(hops, direct):
             st, x = r[0], r[1]
             if st != 200:
                 done.append((fid, None, None, None, f"B http {st}"))
                 continue
-            d = re.findall(r'href="(https://fsldownload\.com/d/[^"]+)"', x)
-            if not d:
+            cands = direct_links(x)
+            if not cands:
+                if os.environ.get("TEST") and len(diag_b) < 10:
+                    diag_b.append(fid)
+                    hosts = {}
+                    for hst in re.findall(r'href="https://([^"/]+)', x):
+                        hosts[hst] = hosts.get(hst, 0) + 1
+                    print(f"[diag] B page without a direct link; href hosts: {hosts}", flush=True)
                 done.append((fid, None, None, None, "no direct link"))
                 continue
-            fetched.append((fid, unescape(d[0])))
-        # the ranged proof is plain urllib (no session): all of a title's files together
+            fetched.append((fid, cands))
+        # the ranged proof is plain urllib (no session): all of a title's files together.
+        # Try every candidate in order; the first that answers 206 + video/* wins. A B page
+        # can carry more than one pub-*.r2.dev href (watch page + file), so a single pick is wrong.
         async def _proof(u):
             try:
                 return await asyncio.to_thread(check_direct, u)
             except Exception as e:  # noqa: BLE001  (403/410 answer as an error, not a crash)
                 return (None, None, str(e)[:150])
-        proofs = await asyncio.gather(*[_proof(u) for _, u in fetched]) if fetched else []
-        for (fid, u), (size, name, perr) in zip(fetched, proofs):
-            done.append((fid, u, size, name, perr))
+        flat = [(fid, u) for fid, cands in fetched for u in cands]
+        proofs = await asyncio.gather(*[_proof(u) for _, u in flat]) if flat else []
+        won = {}
+        for (fid, u), (size, name, perr) in zip(flat, proofs):
+            if fid not in won and not perr:
+                won[fid] = (u, size, name)
+        for fid, cands in fetched:
+            if fid in won:
+                u, size, name = won[fid]
+                done.append((fid, u, size, name, None))
+            else:
+                if os.environ.get("TEST") and len(diag_b) < 10:
+                    diag_b.append(fid)
+                    print(f"[diag] B page candidates all failed proof: {[c[:160] for c in cands[:3]]}", flush=True)
+                done.append((fid, None, None, None, "no direct link"))
         for fid, url, size, name, err in done:
             start = None
             if url and not err:
