@@ -633,10 +633,20 @@ def reset_stale_once(conn) -> None:
 
 
 async def do_resolve(s, conn, limit: int) -> int:
+    # 2026-11-16 (owner's go-ahead): fsldownload.com's DNS is gone, so a file whose stored link is still
+    # an fsldownload /d/ link is dead with certainty — yet the queue below sorted by the post's lastmod
+    # (newest first) behind ~21,830 dead links, and a round's ~1,500 slots never reached the oldest
+    # ones: the Library's fsldownload count froze at exactly 7,650 for ~7 h (13 heal checks) while the
+    # runs kept succeeding. Files still carrying an fsldownload link are now admitted even inside the
+    # 24 h retry window and sorted FIRST, so every round drains that frozen tail before renewing newer
+    # links. A failed resolve clears the stored url (mark()), so a file leaves this pool on its first
+    # attempt either way and cannot hold the front of the queue twice.
     rows = conn.execute(
         "SELECT f.fid, f.path, f.aurl FROM files f JOIN items i ON i.path=f.path WHERE f.aurl IS NOT NULL AND "
-        "(f.resolved_at IS NULL OR (f.res_err IS NOT NULL AND f.res_err NOT LIKE 'archive%' AND f.resolved_at < ?)) "
-        "ORDER BY COALESCE(i.lastmod,'') DESC, f.quality=720 DESC, f.quality DESC LIMIT ?", (int(time.time()) - 86400, limit)).fetchall()
+        "(f.resolved_at IS NULL OR (f.res_err IS NOT NULL AND f.res_err NOT LIKE 'archive%' AND f.resolved_at < ?) "
+        "OR (f.host='r2' AND f.url LIKE 'https://fsldownload.com/%' AND (f.res_err IS NULL OR f.res_err NOT LIKE 'archive%'))) "
+        "ORDER BY (f.url LIKE 'https://fsldownload.com/%') DESC, COALESCE(i.lastmod,'') DESC, f.quality=720 DESC, f.quality DESC LIMIT ?",
+        (int(time.time()) - 86400, limit)).fetchall()
     # Viktor 2026-11-03: posts found only on the /adult18plus listing carry no sitemap lastmod, so COALESCE(lastmod,'')
     # sorted them last and the 1,500-file round (always full of link renewals) never reached them: 292 18+ posts were
     # indexed on 31 Oct but only 76 reached the Library by 3 Nov. A fifth of every round now goes to files that were
